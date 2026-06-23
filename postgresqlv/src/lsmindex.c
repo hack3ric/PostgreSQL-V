@@ -1275,6 +1275,8 @@ ensure_index_loaded(int slot_idx)
         if (pg_atomic_compare_exchange_u32(&slot->valid, &expected,
                                            (uint32) LSM_SLOT_LOADING_INDEX))
         {
+            volatile bool held = false;
+
             /* Winner: clear any stale state_error from a prior attempt. */
             pg_atomic_write_u32(&slot->state_error, 0);
 
@@ -1328,12 +1330,37 @@ ensure_index_loaded(int slot_idx)
                     }
                 }
 
+                /*
+                 * The load is shared work done on behalf of every backend
+                 * waiting on this slot. Hold off this backend's own interrupts
+                 * across the load AND the QUERYABLE publish. Otherwise a
+                 * statement cancel (e.g. a short client-side statement_timeout)
+                 * firing in the window after the load finishes but before we
+                 * publish would divert us into PG_CATCH, discard the completed
+                 * load as state_error=1, fail every waiter, and force the next
+                 * backend to redo the whole load -- which is cancelled the same
+                 * way, so the index never becomes QUERYABLE under load. With
+                 * interrupts held, the pending cancel is honored only after the
+                 * slot is QUERYABLE, so the shared work is preserved.
+                 */
+                HOLD_INTERRUPTS();
+                held = true;
                 index_load_blocking(slot->lsmIndex.indexRelId, slot_idx);
                 pg_write_barrier();
                 pg_atomic_write_u32(&slot->valid, (uint32) LSM_SLOT_QUERYABLE);
+                held = false;
+                RESUME_INTERRUPTS();
             }
             PG_CATCH();
             {
+                /*
+                 * Balance HOLD_INTERRUPTS only if index_load_blocking raised a
+                 * real error while we were still holding (a cancel cannot fire
+                 * while held, so reaching here with held==true means a genuine
+                 * load failure). The load genuinely failed: revert the slot.
+                 */
+                if (held)
+                    RESUME_INTERRUPTS();
                 pg_atomic_write_u32(&slot->state_error, 1);
                 pg_atomic_write_u32(&slot->valid, (uint32) LSM_SLOT_WRITABLE);
                 ConditionVariableBroadcast(&slot->state_cv);
@@ -1352,31 +1379,46 @@ ensure_index_loaded(int slot_idx)
      *   - QUERYABLE: success.
      *   - WRITABLE: the winner errored and reverted; we report failure.
      */
-    PG_TRY();
+    /*
+     * NB: never `return` from inside this PG_TRY block. A return would skip
+     * PG_END_TRY(), leaving PG_exception_stack pointing at this function's
+     * (now-dead) sigjmp_buf; the next ereport(ERROR) in this backend -- e.g. a
+     * statement cancel -- would siglongjmp into the destroyed frame and abort
+     * the process ("longjmp causes uninitialized stack frame"), taking the
+     * whole cluster down. Break out of the loop and return after PG_END_TRY.
+     */
     {
-        ConditionVariablePrepareToSleep(&slot->state_cv);
-        for (;;)
+        bool loaded = false;
+
+        PG_TRY();
         {
-            v = pg_atomic_read_u32(&slot->valid);
-            if (v == (uint32) LSM_SLOT_QUERYABLE)
+            ConditionVariablePrepareToSleep(&slot->state_cv);
+            for (;;)
             {
-                ConditionVariableCancelSleep();
-                return true;
+                v = pg_atomic_read_u32(&slot->valid);
+                if (v == (uint32) LSM_SLOT_QUERYABLE)
+                {
+                    loaded = true;
+                    break;
+                }
+                if (v == (uint32) LSM_SLOT_WRITABLE)
+                {
+                    loaded = false;
+                    break;
+                }
+                ConditionVariableSleep(&slot->state_cv, PG_WAIT_EXTENSION);
             }
-            if (v == (uint32) LSM_SLOT_WRITABLE)
-            {
-                ConditionVariableCancelSleep();
-                return false;
-            }
-            ConditionVariableSleep(&slot->state_cv, PG_WAIT_EXTENSION);
+            ConditionVariableCancelSleep();
         }
+        PG_CATCH();
+        {
+            ConditionVariableCancelSleep();
+            PG_RE_THROW();
+        }
+        PG_END_TRY();
+
+        return loaded;
     }
-    PG_CATCH();
-    {
-        ConditionVariableCancelSleep();
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
 }
 
 LSMIndex
@@ -1981,57 +2023,90 @@ search_lsm_index(Relation index, const void *vector, int k, int nprobe_efs)
 
     LWLockRelease(lsm->mt_lock);
 
-    // step 2. issue a search task to the vector search process
-    vector_search_send(index->rd_id, (float *)vector, lsm->dim, lsm->elem_size, k, nprobe_efs, lsm_snapshot);
-    
-    // step 3. search the growing memtables (update the reference count after search)
-    DistancePair *final_pairs, *pair_1;
-    int num_1;
+    /*
+     * From here on we hold ref_counts on the snapshot memtables until each
+     * sub-search finishes. Any ereport(ERROR) raised in between -- a statement
+     * cancel, palloc OOM, a full ring buffer in vector_search_send -- would
+     * longjmp straight out and leak those refs, pinning the memtables so flush
+     * and merge can never reclaim them. Wrap the region in PG_TRY/PG_CATCH and
+     * drop whatever refs are still outstanding on the error path.
+     */
+    volatile bool gmt_held = true;     /* growing-memtable ref still outstanding */
+    volatile int sealed_released = 0;  /* # of sealed refs already dropped (from front) */
+    TopKTuples topk_result = { .num_results = 0, .pairs = NULL };
 
-    DistancePair *gmt_pairs = palloc(sizeof(DistancePair) * k);
-    int gmt_num = search_growing_memtable(MT_FROM_SLOTIDX(lsm_snapshot.gidx), vector, k, gmt_pairs);
-    num_1 = gmt_num;
-    pair_1 = gmt_pairs;
-    pg_atomic_add_fetch_u32(&SharedMemtableBuffer->slots[lsm_snapshot.gidx].ref_count, -1);
-
-    // step 4. search the immutable memtables (update the reference count after searches)
-    for (int i = 0; i < lsm_snapshot.scount; i++)
+    PG_TRY();
     {
-        DistancePair *smt_pairs = palloc(sizeof(DistancePair) * k);
-        int smt_num = search_sealed_memtable(MT_FROM_SLOTIDX(lsm_snapshot.sidxs[i]), vector, k, smt_pairs);
-        // merge smt_pairs into pair_1
+        // step 2. issue a search task to the vector search process
+        vector_search_send(index->rd_id, (float *)vector, lsm->dim, lsm->elem_size, k, nprobe_efs, lsm_snapshot);
+
+        // step 3. search the growing memtables (update the reference count after search)
+        DistancePair *final_pairs, *pair_1;
+        int num_1;
+
+        DistancePair *gmt_pairs = palloc(sizeof(DistancePair) * k);
+        int gmt_num = search_growing_memtable(MT_FROM_SLOTIDX(lsm_snapshot.gidx), vector, k, gmt_pairs);
+        num_1 = gmt_num;
+        pair_1 = gmt_pairs;
+        pg_atomic_add_fetch_u32(&SharedMemtableBuffer->slots[lsm_snapshot.gidx].ref_count, -1);
+        gmt_held = false;
+
+        // step 4. search the immutable memtables (update the reference count after searches)
+        for (int i = 0; i < lsm_snapshot.scount; i++)
+        {
+            DistancePair *smt_pairs = palloc(sizeof(DistancePair) * k);
+            int smt_num = search_sealed_memtable(MT_FROM_SLOTIDX(lsm_snapshot.sidxs[i]), vector, k, smt_pairs);
+            // merge smt_pairs into pair_1
+            final_pairs = palloc(sizeof(DistancePair) * k);
+            int merge_num = merge_top_k(pair_1, smt_pairs, num_1, smt_num, k, final_pairs);
+            pfree(pair_1);
+            pfree(smt_pairs);
+            num_1 = merge_num;
+            pair_1 = final_pairs;
+            pg_atomic_add_fetch_u32(&SharedMemtableBuffer->slots[lsm_snapshot.sidxs[i]].ref_count, -1);
+            sealed_released = i + 1;
+        }
+
+        // step 5. merge the results (wait for the results from the vector search process if not ready yet)
+        VectorSearchResult vs_result = vector_search_get_result();
+        int64_t *res_id = vs_search_result_id_at(vs_result);
+        float *res_dist = vs_search_result_dist_at(vs_result);
+        DistancePair *segment_pairs = palloc(sizeof(DistancePair) * k);
+        for (int i = 0; i < vs_result->result_count; i++)
+        {
+            segment_pairs[i].id = res_id[i];
+            segment_pairs[i].distance = res_dist[i];
+        }
+        // merge segment_pairs into pair_1
+        // dedup by TID: a merged segment that partially overlaps the snapshot is
+        // now searched on both sides, so the overlapping slice yields identical
+        // TIDs from memtable and segment results.
         final_pairs = palloc(sizeof(DistancePair) * k);
-        int merge_num = merge_top_k(pair_1, smt_pairs, num_1, smt_num, k, final_pairs);
+        int final_num = merge_top_k_dedup(pair_1, segment_pairs, num_1, vs_result->result_count, k, final_pairs);
         pfree(pair_1);
-        pfree(smt_pairs);
-        num_1 = merge_num;
-        pair_1 = final_pairs;
-        pg_atomic_add_fetch_u32(&SharedMemtableBuffer->slots[lsm_snapshot.sidxs[i]].ref_count, -1);
-    }
-    
-    // step 5. merge the results (wait for the results from the vector search process if not ready yet)
-    VectorSearchResult vs_result = vector_search_get_result();
-    int64_t *res_id = vs_search_result_id_at(vs_result);
-    float *res_dist = vs_search_result_dist_at(vs_result);
-    DistancePair *segment_pairs = palloc(sizeof(DistancePair) * k);
-    for (int i = 0; i < vs_result->result_count; i++)
-    {
-        segment_pairs[i].id = res_id[i];
-        segment_pairs[i].distance = res_dist[i];
-    }
-    // merge segment_pairs into pair_1
-    // dedup by TID: a merged segment that partially overlaps the snapshot is
-    // now searched on both sides, so the overlapping slice yields identical
-    // TIDs from memtable and segment results.
-    final_pairs = palloc(sizeof(DistancePair) * k);
-    int final_num = merge_top_k_dedup(pair_1, segment_pairs, num_1, vs_result->result_count, k, final_pairs);
-    pfree(pair_1);
-    pfree(segment_pairs);
+        pfree(segment_pairs);
 
-    TopKTuples topk_result = {
-        .num_results = final_num,
-        .pairs = final_pairs
-    };
+        topk_result.num_results = final_num;
+        topk_result.pairs = final_pairs;
+    }
+    PG_CATCH();
+    {
+        /*
+         * Release any snapshot ref_counts still outstanding so an error during
+         * the search cannot pin memtables and block flush/merge forever. The
+         * happy path drops each ref as it finishes; here we drop whatever is
+         * left: the growing memtable (if not yet released) and the tail of the
+         * sealed list that the loop did not reach.
+         */
+        if (gmt_held)
+            pg_atomic_add_fetch_u32(&SharedMemtableBuffer->slots[lsm_snapshot.gidx].ref_count, -1);
+        for (int j = sealed_released; j < lsm_snapshot.scount; j++)
+            pg_atomic_add_fetch_u32(&SharedMemtableBuffer->slots[lsm_snapshot.sidxs[j]].ref_count, -1);
+
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
     return topk_result;
 }
 

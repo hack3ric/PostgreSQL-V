@@ -14,6 +14,8 @@
 #include <vector>
 #include <algorithm>
 #include <cstring>
+#include <thread>
+#include <chrono>
 
 using rbc::Step;
 
@@ -26,6 +28,14 @@ struct Args {
     long mixed_mode_start = 101, mixed_size = 3, checkpoint = 1000, dataset_offset = 0;
     long duration_sec = 0;
     bool assume_synced = false;
+    // VACUUM ANALYZE on the primary after every N delete steps (0 = disabled).
+    // Counts delete steps within each mixed-mode group. Only used in --role primary.
+    // "sync"  — block the runbook walk until VACUUM returns;
+    // "async" — dispatch on a background thread with its own primary connection;
+    //           if a prior async VACUUM is still running when the next trigger
+    //           fires, the driver joins it first (back-pressure).
+    long vacuum_every_n_deletes = 0;
+    std::string vacuum_mode = "sync";
 };
 
 static std::atomic<bool> g_stop{false};
@@ -106,6 +116,68 @@ static int run_standby(const Args& a){
     return 0;
 }
 
+// Run VACUUM ANALYZE on a caller-owned connection (sync path reuses the main
+// thread's ThreadConn; async path uses a dedicated one). Closes nothing.
+static void run_vacuum(PGconn* conn, const std::string& table, long step_num,
+                       long counter_value, const char* tag){
+    std::string sql = "VACUUM ANALYZE " + table;
+    std::cerr << "[VACUUM] " << tag << " '" << sql << "' after "
+              << counter_value << " delete step(s) (step " << step_num << ")..."
+              << std::flush;
+    auto t0 = std::chrono::steady_clock::now();
+    PGresult* r = PQexec(conn, sql.c_str());
+    double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
+    if (PQresultStatus(r) != PGRES_COMMAND_OK)
+        std::cerr << " FAILED: " << PQerrorMessage(conn);
+    else
+        std::cerr << " done (" << std::fixed << std::setprecision(2) << elapsed << "s)";
+    std::cerr << "\n";
+    PQclear(r);
+}
+
+// Trigger VACUUM ANALYZE on the primary when the delete-step counter hits a
+// multiple of N. Dispatches synchronously or asynchronously per vacuum_mode.
+static void maybe_vacuum_after_delete(const Args& a, long step_num,
+                                      long& delete_step_counter,
+                                      std::thread& vacuum_thread){
+    if (a.vacuum_every_n_deletes == 0) return;
+    delete_step_counter++;
+    if (delete_step_counter % a.vacuum_every_n_deletes != 0) return;
+    long counter_value = delete_step_counter;
+
+    if (a.vacuum_mode == "async") {
+        // Back-pressure: if a prior async VACUUM is still running, wait for it
+        // before starting another so "every N deletes" semantics hold without
+        // piling up concurrent VACUUMs.
+        if (vacuum_thread.joinable()) {
+            std::cerr << "[VACUUM] (async) previous VACUUM still in flight, waiting...\n";
+            vacuum_thread.join();
+        }
+        std::string conninfo = rbc::ThreadConn::conninfo;
+        std::string table = a.table;
+        vacuum_thread = std::thread([conninfo, table, step_num, counter_value]() {
+            PGconn* conn = PQconnectdb(conninfo.c_str());
+            if (PQstatus(conn) != CONNECTION_OK) {
+                std::cerr << "[VACUUM] (async) no connection, skipping: "
+                          << PQerrorMessage(conn) << "\n";
+                PQfinish(conn);
+                return;
+            }
+            run_vacuum(conn, table, step_num, counter_value, "(async)");
+            PQfinish(conn);
+        });
+        return;
+    }
+
+    // Sync path — reuse the calling (main) thread's ThreadConn.
+    PGconn* conn = rbc::ThreadConn::get();
+    if (!conn) {
+        std::cerr << "[VACUUM] no connection available, skipping\n";
+        return;
+    }
+    run_vacuum(conn, a.table, step_num, counter_value, "(sync)");
+}
+
 // ---------------- role=primary ----------------
 static int run_primary(const Args& a){
     long long offset = prime_offset(a);
@@ -121,7 +193,12 @@ static int run_primary(const Args& a){
     std::ofstream csv(a.out.empty()? "step_boundaries.csv" : a.out);
     csv << "step,timestamp_ms\n";
 
+    // VACUUM bookkeeping (primary-side; standby picks it up via WAL replay).
+    long delete_step_counter = 0;
+    std::thread vacuum_thread;
+
     // Walk in groups of mixed_size starting at mixed_mode_start.
+    bool any_group = false;
     size_t i = 0;
     while (i < steps.size()) {
         if ((long)steps[i].step_num < a.mixed_mode_start) { ++i; continue; }
@@ -133,6 +210,7 @@ static int run_primary(const Args& a){
 
         csv << group.front().step_num << "," << (rbc::now_ms()+offset) << "\n";
         csv.flush();
+        any_group = true;
 
         // Build a shuffled work array: one entry per op-item, value = index into group.
         std::vector<size_t> work;
@@ -181,6 +259,30 @@ static int run_primary(const Args& a){
         std::cerr << " (" << std::fixed << std::setprecision(1)
                   << std::chrono::duration<double>(std::chrono::steady_clock::now()-gstart).count()
                   << "s)\n";
+
+        // After the group's ops complete, fire VACUUM once per delete step in
+        // the group (mirrors the mixed-mode behavior in pgvector_test.cpp).
+        for (const Step& st : group)
+            if (st.op == "delete")
+                maybe_vacuum_after_delete(a, st.step_num, delete_step_counter, vacuum_thread);
+    }
+
+    // Record the completion time of the final group so the last group has a
+    // closing boundary (its duration/throughput is otherwise uncomputable).
+    // Captured here — after the last group's ops and its post-group VACUUM
+    // triggers, but before joining any in-flight async VACUUM — to match how
+    // every other group's start timestamp is taken (the next iteration's start
+    // row is written without waiting on background VACUUM). Sentinel step -1
+    // marks end-of-workload rather than a new group start.
+    if (any_group) {
+        csv << -1 << "," << (rbc::now_ms()+offset) << "\n";
+        csv.flush();
+    }
+
+    // Wait for any in-flight async VACUUM before returning.
+    if (vacuum_thread.joinable()) {
+        std::cerr << "[VACUUM] waiting for in-flight async VACUUM to finish...\n";
+        vacuum_thread.join();
     }
     std::cerr << "primary: workload complete -> " << (a.out.empty()?"step_boundaries.csv":a.out) << "\n";
     return 0;
@@ -195,7 +297,8 @@ static void usage(const char* prog){
       "  --index-type hnsw|ivfflat --hnsw-ef-search N --ivfflat-probes N\n"
       "  --mixed-mode-start N (101) --mixed-size N (3) --threads N (16)\n"
       "  --checkpoint-size N (1000) --dataset-offset N (0) --duration-sec N (0=until SIGINT)\n"
-      "  --assume-synced-clocks  --table-name NAME --out FILE\n";
+      "  --assume-synced-clocks  --table-name NAME --out FILE\n"
+      "  --vacuum-every-n-deletes N (0=off, primary role)  --vacuum-mode sync|async (sync)\n";
 }
 
 int main(int argc, char** argv){
@@ -227,6 +330,13 @@ int main(int argc, char** argv){
         else if (s=="--dataset-offset") a.dataset_offset=std::stol(need(i));
         else if (s=="--duration-sec") a.duration_sec=std::stol(need(i));
         else if (s=="--assume-synced-clocks") a.assume_synced=true;
+        else if (s=="--vacuum-every-n-deletes") a.vacuum_every_n_deletes=std::stol(need(i));
+        else if (s=="--vacuum-mode") {
+            a.vacuum_mode=need(i);
+            if (a.vacuum_mode!="sync" && a.vacuum_mode!="async") {
+                std::cerr << "--vacuum-mode must be 'sync' or 'async'\n"; return 2;
+            }
+        }
         else if (s=="--table-name") a.table=need(i);
         else if (s=="--out") a.out=need(i);
         else { std::cerr<<"unknown arg: "<<s<<"\n"; usage(argv[0]); return 2; }

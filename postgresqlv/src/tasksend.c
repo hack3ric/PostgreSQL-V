@@ -120,6 +120,16 @@ submit_and_wait_maintenance(VectorTaskType task_type, dsm_handle task_hdl,
 
     ResetLatch(MyLatch);
 
+    /*
+     * Clear the completion flag before submitting. The worker sets it to 1 only
+     * when the task truly finishes; we poll it below instead of trusting a bare
+     * latch wakeup. MyLatch is set for many unrelated reasons (a statement_timeout
+     * or query-cancel signal, etc.), and returning on such a wakeup would make
+     * the caller act as if the task were done -- e.g. publishing a half-loaded
+     * index as QUERYABLE while the segment load is still running.
+     */
+    vs_search_result_at(MyProcNumber)->maint_done = 0;
+
     LWLockAcquire(ring_buffer_shmem->lock, LW_EXCLUSIVE);
 
     if (ring_buffer_shmem->count == ring_buffer_shmem->ring_size)
@@ -153,12 +163,13 @@ submit_and_wait_maintenance(VectorTaskType task_type, dsm_handle task_hdl,
                     (errmsg("[%s] postmaster died while waiting for worker",
                             caller_name)));
 
-        if (rc & WL_LATCH_SET)
+        if (vs_search_result_at(MyProcNumber)->maint_done)
         {
+            pg_read_barrier();  /* observe maint_status/results set before the flag */
             elog(DEBUG1, "[%s] maintenance task completed", caller_name);
             break;
         }
-        /* WL_TIMEOUT: keep waiting. */
+        /* Spurious latch wakeup or WL_TIMEOUT: keep waiting for real completion. */
     }
 }
 

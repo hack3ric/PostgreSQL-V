@@ -27,8 +27,7 @@ python3.12 vector_restart_client.py \\
   --query-vectors /ssd_root/dataset/turing10m/msturing-query.fvecs \\
   --clients 1 --total-qps 20 --duration 180 --timeout-ms 50 \\
   --k 100 --table vectors \\
-  --output /ssd_root/liu4127/output_1c.csv \\
-  --summary-output /ssd_root/liu4127/summary_1c.csv
+  --output /ssd_root/liu4127/output_1c.csv
 
 # 16 clients, 160 QPS total
 python3.12 vector_restart_client.py \\
@@ -36,8 +35,7 @@ python3.12 vector_restart_client.py \\
   --query-vectors /ssd_root/dataset/turing10m/msturing-query.fvecs \\
   --clients 16 --total-qps 160 --duration 180 --timeout-ms 50 \\
   --k 100 --table vectors \\
-  --output /ssd_root/liu4127/output_16c.csv \\
-  --summary-output /ssd_root/liu4127/summary_16c.csv
+  --output /ssd_root/liu4127/output_16c.csv
 """
 
 import argparse
@@ -46,7 +44,6 @@ import csv
 import struct
 import sys
 import time
-from collections import Counter
 from pathlib import Path
 
 import asyncpg
@@ -106,28 +103,42 @@ def load_vectors(path: str, limit=None) -> np.ndarray:
 
 # ── Connection helpers ────────────────────────────────────────────────────────
 
-async def _open_conn(args) -> asyncpg.Connection:
+async def _open_conn(args, stmt_timeout_ms=None) -> asyncpg.Connection:
     conn = await asyncpg.connect(
         host=args.host,
         port=args.port,
         user=args.user,
         password=args.password or None,
         database=args.dbname,
-        # No global command_timeout; we impose per-query timeouts manually.
+        # No global command_timeout; the per-query deadline is enforced by the
+        # server via statement_timeout (set below).
         command_timeout=None,
     )
-    await conn.execute(f"SET hnsw.ef_search = {args.ef_search}")
-    await conn.execute(f"SET ivfflat.probes  = {args.nprobe}")
+    try:
+        await conn.execute(f"SET hnsw.ef_search = {args.ef_search}")
+        await conn.execute(f"SET ivfflat.probes  = {args.nprobe}")
+        if stmt_timeout_ms is not None:
+            # Server enforces the per-query timeout and cancels the query itself,
+            # returning the connection to a clean idle state. This lets us REUSE
+            # the connection after a timeout instead of reconnecting, so a slow
+            # cold-start load can't strand a fresh backend per timeout and
+            # exhaust max_connections ("sorry, too many clients already").
+            await conn.execute(f"SET statement_timeout = {int(stmt_timeout_ms)}")
+    except BaseException:
+        # Don't leak the just-established backend if setup is cancelled/fails.
+        conn.terminate()
+        raise
     return conn
 
 
-async def connect_with_retry(args, *, max_wait: float = 60.0) -> asyncpg.Connection:
+async def connect_with_retry(args, *, max_wait: float = 60.0,
+                             stmt_timeout_ms=None) -> asyncpg.Connection:
     """Retry every 0.5 s until connected or max_wait seconds elapsed."""
     deadline = time.monotonic() + max_wait
     last_exc: Exception | None = None
     while True:
         try:
-            return await _open_conn(args)
+            return await _open_conn(args, stmt_timeout_ms=stmt_timeout_ms)
         except Exception as e:
             last_exc = e
         remaining = deadline - time.monotonic()
@@ -136,6 +147,27 @@ async def connect_with_retry(args, *, max_wait: float = 60.0) -> asyncpg.Connect
                 f"Could not connect to {args.host}:{args.port} after {max_wait:.0f}s"
             ) from last_exc
         await asyncio.sleep(min(0.5, remaining))
+
+
+async def try_reconnect(args, timeout=None, stmt_timeout_ms=None):
+    """Single, bounded reconnect attempt.
+
+    Returns a live Connection, or None if the server is currently unavailable
+    (e.g. refusing connections during crash recovery: 'the database system is
+    in recovery mode'). Unlike connect_with_retry() this does NOT loop.
+
+    `timeout` bounds the attempt: during a crash-restart the postmaster stops
+    accepting connections and a bare asyncpg.connect() (no timeout) would block
+    in the kernel listen backlog for the entire ~1.5s outage, parking this
+    worker on a single await and producing a gap in the output. With a short
+    timeout each attempt fails fast, so the caller records one connection_error
+    per scheduled slot at the target QPS instead of one long gap.
+    """
+    try:
+        return await asyncio.wait_for(
+            _open_conn(args, stmt_timeout_ms=stmt_timeout_ms), timeout=timeout)
+    except Exception:
+        return None
 
 
 # ── Client worker ─────────────────────────────────────────────────────────────
@@ -183,10 +215,20 @@ async def client_worker(
     raw_to = args.timeout_ms / 1000.0
     eff_to = raw_to if raw_to * qps < 1.0 else interval
 
+    # The per-query deadline is enforced server-side via statement_timeout; the
+    # server cancels the query and returns the connection clean, so we reuse it
+    # on timeout instead of reconnecting (which would strand a backend per
+    # timeout during a slow cold start and exhaust max_connections).
+    stmt_to_ms = max(1, int(round(eff_to * 1000)))
+    # Client-side backstop: only catches a backend that can't honor
+    # statement_timeout promptly (e.g. the cold-start load winner holding
+    # interrupts). Generous so the server's deadline always wins normally.
+    backstop_to = max(10.0, eff_to * 50)
+
     sql = _SQL_TEMPLATE.format(table=args.table)
     n_vecs = len(qvecs)
 
-    conn = await connect_with_retry(args)
+    conn = await connect_with_retry(args, stmt_timeout_ms=stmt_to_ms)
 
     # Stagger clients so their first queries are spread evenly within one interval.
     stagger = cid * interval / max(args.clients, 1)
@@ -217,63 +259,92 @@ async def client_worker(
         end_abs = actual_start          # updated on every path below
         reconnected = False
 
-        try:
-            # Enforce timeout via asyncio.wait_for so it fires even if asyncpg's
-            # internal state is confused after repeated server-side cancels.
-            await asyncio.wait_for(conn.fetch(sql, vec_lit, args.k), timeout=eff_to)
-            end_abs = loop.time()
+        # If a previous failure left us disconnected, try once to reconnect for
+        # this slot.  While the server is unavailable (e.g. crash recovery, when
+        # connects are rejected with 'the database system is in recovery mode')
+        # each scheduled slot is recorded as a connection_error instead of
+        # silently blocking, so the outage is visible in the output.
+        if conn is None:
+            conn = await try_reconnect(args, timeout=eff_to, stmt_timeout_ms=stmt_to_ms)
+            if conn is not None:
+                reconnected = True      # back up — reset the schedule below
 
-        except (asyncio.TimeoutError, asyncpg.QueryCanceledError):
-            end_abs = loop.time()
-            status = "timeout"
-            error = f">{eff_to * 1000:.0f}ms"
-            # Always close and reconnect after a timeout.  asyncpg sends a
-            # server-side cancel; if we reuse the same connection the next
-            # query can inherit stale cancel state from the PostgreSQL backend,
-            # causing it to be cancelled immediately without a 50ms wait.
-            try:
-                await asyncio.wait_for(conn.close(), timeout=1.0)
-            except Exception:
-                pass
-            conn = await connect_with_retry(args)
-            reconnected = True
-
-        except _CONN_ERRORS as exc:
+        if conn is None:
             end_abs = loop.time()
             status = "connection_error"
-            error = repr(exc)[:120]
+            error = "server unavailable (recovery/reconnect)"
+        else:
             try:
-                await conn.close()
-            except Exception:
-                pass
-            conn = await connect_with_retry(args)
-            reconnected = True
+                # The per-query deadline is enforced by the server via
+                # statement_timeout; on expiry the server raises QueryCanceledError
+                # and the connection stays clean and reusable. The asyncio.wait_for
+                # is only a generous backstop for a backend that can't honor
+                # statement_timeout promptly (e.g. the cold-start load winner).
+                await asyncio.wait_for(conn.fetch(sql, vec_lit, args.k), timeout=backstop_to)
+                end_abs = loop.time()
 
-        except asyncpg.PostgresError as exc:
-            end_abs = loop.time()
-            status = "sql_error"
-            error = repr(exc)[:120]
-            if conn.is_closed():
+            except asyncpg.QueryCanceledError:
+                # Server hit statement_timeout and cancelled the query for us. The
+                # connection is back to a clean idle state -> REUSE it. Do NOT
+                # reconnect: that would strand this backend (still finishing the
+                # cold-start load) and spawn a fresh one per timeout, exhausting
+                # max_connections.
+                end_abs = loop.time()
+                status = "timeout"
+                error = f">{eff_to * 1000:.0f}ms"
+
+            except asyncio.TimeoutError:
+                # Backstop fired: the server did not cancel within backstop_to, so
+                # the backend is wedged (can't reuse a busy connection). Drop it
+                # and reconnect. Rare -- at most the load winner, not every query.
+                end_abs = loop.time()
+                status = "timeout"
+                error = f">{backstop_to * 1000:.0f}ms (backstop)"
                 try:
-                    await conn.close()
+                    conn.terminate()
                 except Exception:
                     pass
-                conn = await connect_with_retry(args)
-                reconnected = True
+                conn = await try_reconnect(args, timeout=eff_to, stmt_timeout_ms=stmt_to_ms)
+                reconnected = conn is not None
 
-        except Exception as exc:
-            end_abs = loop.time()
-            status = "connection_error"
-            error = repr(exc)[:120]
-            try:
-                await conn.close()
-            except Exception:
-                pass
-            conn = await connect_with_retry(args)
-            reconnected = True
+            except _CONN_ERRORS as exc:
+                end_abs = loop.time()
+                status = "connection_error"
+                error = repr(exc)[:120]
+                try:
+                    conn.terminate()
+                except Exception:
+                    pass
+                conn = await try_reconnect(args, timeout=eff_to, stmt_timeout_ms=stmt_to_ms)
+                reconnected = conn is not None
 
-        # After reconnecting from a crash the schedule may be far in the past.
-        # Reset to now so we don't burst through the accumulated backlog.
+            except asyncpg.PostgresError as exc:
+                end_abs = loop.time()
+                status = "sql_error"
+                error = repr(exc)[:120]
+                if conn.is_closed():
+                    try:
+                        conn.terminate()
+                    except Exception:
+                        pass
+                    conn = await try_reconnect(args, timeout=eff_to, stmt_timeout_ms=stmt_to_ms)
+                    reconnected = conn is not None
+
+            except Exception as exc:
+                end_abs = loop.time()
+                status = "connection_error"
+                error = repr(exc)[:120]
+                try:
+                    conn.terminate()
+                except Exception:
+                    pass
+                conn = await try_reconnect(args, timeout=eff_to, stmt_timeout_ms=stmt_to_ms)
+                reconnected = conn is not None
+
+        # After a successful (re)connect the schedule may be far in the past.
+        # Reset to now so we don't burst through the accumulated backlog. While
+        # the server stays down we deliberately do NOT reset, so the open-loop
+        # schedule keeps firing one connection_error per slot at the target QPS.
         if reconnected:
             next_sched = loop.time()
 
@@ -340,52 +411,6 @@ async def csv_writer_task(out_q: asyncio.Queue, path: str, flush_s: float = 2.0)
     return written
 
 
-# ── Summary ───────────────────────────────────────────────────────────────────
-
-def write_summary(summary_path: str, data_path: str, args, elapsed_s: float) -> None:
-    """Re-reads the per-query CSV and writes one-row summary (easy to stack across runs)."""
-    status_cnt: Counter = Counter()
-    lats_ok: list[float] = []
-
-    with open(data_path, newline="") as f:
-        for row in csv.DictReader(f):
-            status_cnt[row["status"]] += 1
-            if row["status"] == "ok":
-                lats_ok.append(float(row["latency_ms"]))
-
-    total = sum(status_cnt.values())
-    lats = np.array(lats_ok) if lats_ok else np.array([float("nan")])
-
-    def pct(p):
-        return f"{np.nanpercentile(lats, p):.3f}" if lats_ok else "nan"
-
-    header = [
-        "clients", "total_qps", "duration_s", "timeout_ms", "k", "ef_search", "nprobe",
-        "total_queries", "ok", "timeout", "sql_error", "connection_error",
-        "achieved_qps", "mean_ms", "p50_ms", "p95_ms", "p99_ms", "p999_ms",
-    ]
-    row = [
-        args.clients, args.total_qps, f"{elapsed_s:.2f}", args.timeout_ms,
-        args.k, args.ef_search, args.nprobe,
-        total,
-        status_cnt.get("ok", 0),
-        status_cnt.get("timeout", 0),
-        status_cnt.get("sql_error", 0),
-        status_cnt.get("connection_error", 0),
-        f"{total / elapsed_s:.2f}",
-        f"{np.nanmean(lats):.3f}" if lats_ok else "nan",
-        pct(50), pct(95), pct(99), pct(99.9),
-    ]
-
-    # Append if file already exists (to stack multiple runs), write header only once.
-    write_header = not Path(summary_path).exists()
-    with open(summary_path, "a", newline="") as f:
-        w = csv.writer(f)
-        if write_header:
-            w.writerow(header)
-        w.writerow(row)
-
-
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
 async def run(args, qvecs: np.ndarray) -> None:
@@ -418,10 +443,6 @@ async def run(args, qvecs: np.ndarray) -> None:
         f"{written} queries in {elapsed:.1f}s ({written / elapsed:.1f} QPS achieved)"
         f"  →  {args.output}"
     )
-
-    if args.summary_output:
-        write_summary(args.summary_output, args.output, args, elapsed)
-        print(f"Summary → {args.summary_output}")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -477,8 +498,6 @@ def build_parser() -> argparse.ArgumentParser:
     o = p.add_argument_group("Output")
     o.add_argument("--output", required=True, metavar="CSV",
                    help="Per-query CSV output path")
-    o.add_argument("--summary-output", default=None, dest="summary_output", metavar="CSV",
-                   help="Aggregate summary CSV path (optional)")
 
     return p
 

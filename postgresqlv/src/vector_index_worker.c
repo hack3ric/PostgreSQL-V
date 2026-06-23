@@ -510,9 +510,14 @@ maintenance_worker_thread(void *arg)
                     load_all_segments_from_disk_mmap(index_relid, pool_seg);
 
                     // Signal backend — segments are now searchable via mmap.
+                    // (Intentional early signal: in mmap mode phase 1 is the
+                    // point at which the index is queryable; the upgrade runs in
+                    // the background.)
                     // TODO: for debugging
                     fprintf(stderr, "[maintenance_worker] IndexLoadTaskType: phase 1 complete,"
                             " signaling backend pgprocno=%d\n", load_task->backend_pgprocno);
+                    vs_search_result_at(load_task->backend_pgprocno)->maint_done = 1;
+                    pg_write_barrier();   /* publish state before the completion flag */
                     SetLatch(&ProcGlobal->allProcs[load_task->backend_pgprocno].procLatch);
                     client = NULL;  // suppress the post-switch SetLatch
                     signal_merge_pool();  /* mmap-loaded segments are now searchable */
@@ -678,8 +683,14 @@ maintenance_worker_thread(void *arg)
                 break;
             }
             
-            // Notify the client backend
+            // Notify the client backend. Mark the task done BEFORE setting the
+            // latch so the backend (which polls maint_done, not the bare latch)
+            // only returns once the task has truly finished. Recover the backend's
+            // ProcNumber from its PGPROC slot index in allProcs.
             if (client != NULL) {
+                int signaled_procno = (int) (client - ProcGlobal->allProcs);
+                vs_search_result_at(signaled_procno)->maint_done = 1;
+                pg_write_barrier();   /* publish maint_status/results before the flag */
                 SetLatch(&client->procLatch);
             }
 

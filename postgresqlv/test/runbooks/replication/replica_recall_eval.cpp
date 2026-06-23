@@ -25,6 +25,13 @@ struct Args {
     int threads = 8, catchup_timeout_sec = 300, settle_ms = 0;
     // index build params (used only if build_index_before > 0)
     int hnsw_m = 16, hnsw_ef_construction = 40, ivfflat_lists = 100;
+    // VACUUM ANALYZE on the primary after every N delete steps (0 = disabled).
+    // "sync"  — block the runbook walk until VACUUM returns;
+    // "async" — dispatch on a background thread with its own primary connection;
+    //           if a prior async VACUUM is still running when the next trigger
+    //           fires, the driver joins it first (back-pressure).
+    long vacuum_every_n_deletes = 0;
+    std::string vacuum_mode = "sync";
 };
 
 static std::string conninfo(const std::string& h,const std::string& p,const std::string& db,
@@ -127,6 +134,64 @@ static void delete_range(PGconn* p, const Args& a, long s, long e){
     PQclear(r);
 }
 
+// Run VACUUM ANALYZE on a caller-owned connection (the sync path reuses the
+// shared primary connection; the async path uses a dedicated one). Closes
+// nothing — the caller decides whether the connection is reusable.
+static void run_vacuum(PGconn* conn, const std::string& table, long step_num,
+                       long counter_value, const char* tag){
+    std::string sql = "VACUUM ANALYZE " + table;
+    std::cerr << "[VACUUM] " << tag << " '" << sql << "' after "
+              << counter_value << " delete step(s) (step " << step_num << ")..."
+              << std::flush;
+    auto t0 = std::chrono::steady_clock::now();
+    PGresult* r = PQexec(conn, sql.c_str());
+    double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
+    if (PQresultStatus(r) != PGRES_COMMAND_OK)
+        std::cerr << " FAILED: " << PQerrorMessage(conn);
+    else
+        std::cerr << " done (" << std::fixed << std::setprecision(2) << elapsed << "s)";
+    std::cerr << "\n";
+    PQclear(r);
+}
+
+// Trigger VACUUM ANALYZE on the primary when the delete-step counter hits a
+// multiple of N. Dispatches synchronously or asynchronously per vacuum_mode.
+static void maybe_vacuum_after_delete(PGconn* primary, const std::string& pconn,
+                                      const Args& a, long step_num,
+                                      long& delete_step_counter,
+                                      std::thread& vacuum_thread){
+    if (a.vacuum_every_n_deletes == 0) return;
+    delete_step_counter++;
+    if (delete_step_counter % a.vacuum_every_n_deletes != 0) return;
+    long counter_value = delete_step_counter;
+
+    if (a.vacuum_mode == "async") {
+        // Back-pressure: if a prior async VACUUM is still running, wait for it
+        // before starting another so "every N deletes" semantics hold without
+        // piling up concurrent VACUUMs.
+        if (vacuum_thread.joinable()) {
+            std::cerr << "[VACUUM] (async) previous VACUUM still in flight, waiting...\n";
+            vacuum_thread.join();
+        }
+        std::string table = a.table;
+        vacuum_thread = std::thread([pconn, table, step_num, counter_value]() {
+            PGconn* conn = PQconnectdb(pconn.c_str());
+            if (PQstatus(conn) != CONNECTION_OK) {
+                std::cerr << "[VACUUM] (async) no connection, skipping: "
+                          << PQerrorMessage(conn) << "\n";
+                PQfinish(conn);
+                return;
+            }
+            run_vacuum(conn, table, step_num, counter_value, "(async)");
+            PQfinish(conn);
+        });
+        return;
+    }
+
+    // Sync path — reuse the shared primary connection.
+    run_vacuum(primary, a.table, step_num, counter_value, "(sync)");
+}
+
 static void create_index(PGconn* p, const Args& a){
     std::string sql = a.index_type=="ivfflat"
         ? "CREATE INDEX ON "+a.table+" USING ivfflat (vec vector_l2_ops) WITH (lists="+std::to_string(a.ivfflat_lists)+");"
@@ -150,7 +215,8 @@ static void usage(const char* prog){
       "  --start-step N (101)  --end-step N (400)  --build-index-before N (0=off)\n"
       "  --num-verify-queries N (10000)  --threads N (8)  --checkpoint-size N (1000)\n"
       "  --dataset-offset N (0)  --catchup-timeout-sec N (300)  --standby-settle-ms N (0)\n"
-      "  --hnsw-m N --hnsw-ef-construction N --ivfflat-lists N  --table-name NAME  --out FILE\n";
+      "  --hnsw-m N --hnsw-ef-construction N --ivfflat-lists N  --table-name NAME  --out FILE\n"
+      "  --vacuum-every-n-deletes N (0=off)  --vacuum-mode sync|async (sync)\n";
 }
 
 int main(int argc, char** argv){
@@ -188,6 +254,13 @@ int main(int argc, char** argv){
         else if (s=="--hnsw-m") a.hnsw_m=std::stoi(need(i));
         else if (s=="--hnsw-ef-construction") a.hnsw_ef_construction=std::stoi(need(i));
         else if (s=="--ivfflat-lists") a.ivfflat_lists=std::stoi(need(i));
+        else if (s=="--vacuum-every-n-deletes") a.vacuum_every_n_deletes=std::stol(need(i));
+        else if (s=="--vacuum-mode") {
+            a.vacuum_mode=need(i);
+            if (a.vacuum_mode!="sync" && a.vacuum_mode!="async") {
+                std::cerr << "--vacuum-mode must be 'sync' or 'async'\n"; return 2;
+            }
+        }
         else if (s=="--table-name") a.table=need(i);
         else if (s=="--out") a.out=need(i);
         else { std::cerr << "unknown arg: " << s << "\n"; usage(argv[0]); return 2; }
@@ -216,6 +289,10 @@ int main(int argc, char** argv){
     long num_q = std::min<long>(a.num_verify, (long)qn);
     bool index_built = false;
     std::vector<Range> ranges = rbc::ranges_up_to(steps, a.start_step);
+
+    // VACUUM bookkeeping (primary-side; standby picks it up via WAL replay).
+    long delete_step_counter = 0;
+    std::thread vacuum_thread;
 
     // Progress: count steps in range for an [done/total] counter; time each step.
     long total = 0, done = 0;
@@ -246,6 +323,8 @@ int main(int argc, char** argv){
             delete_range(primary, a, st.start, st.end);
             ranges.push_back({"delete", st.start, st.end});
             std::cerr << " (" << std::fixed << std::setprecision(1) << secs() << "s)\n";
+            maybe_vacuum_after_delete(primary, pconn, a, st.step_num,
+                                      delete_step_counter, vacuum_thread);
         } else if (st.op == "search") {
             std::cerr << " k=" << st.k << " | catchup..." << std::flush;
             wait_catchup(primary, standby, a.catchup_timeout_sec);
@@ -265,6 +344,11 @@ int main(int argc, char** argv){
                       << " p=" << rp << " s=" << rs << " d=" << std::fabs(rp-rs)
                       << " (" << std::setprecision(1) << secs() << "s)\n";
         }
+    }
+    // Wait for any in-flight async VACUUM before tearing down connections.
+    if (vacuum_thread.joinable()) {
+        std::cerr << "[VACUUM] waiting for in-flight async VACUUM to finish...\n";
+        vacuum_thread.join();
     }
     PQfinish(primary); PQfinish(standby);
     std::cerr << "done -> " << a.out << "\n";

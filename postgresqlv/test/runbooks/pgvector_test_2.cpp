@@ -670,7 +670,8 @@ public:
 
     // Execute runbook in mixed mode with QPS control
     void execute_runbook(const std::string& runbook_file, const std::string& dataset_name,
-                         float* dataset, float* queries, size_t num_queries,
+                         float* dataset, size_t num_dataset_vectors,
+                         float* queries, size_t num_queries,
                          size_t start_step = 0, size_t end_step = 0, 
                          size_t build_index_before = 0,
                          size_t mixed_mode_start = 0, size_t mixed_size = 0) {
@@ -924,11 +925,21 @@ public:
                         // Execute the operation
                         bool operation_failed = false;
                         if (step_info.op == "insert") {
-                            size_t row_id = step_info.start + item_idx + dataset_offset;
-                            size_t dataset_index = step_info.start + item_idx;
+                            size_t vec_idx = step_info.start + item_idx;
+                            size_t dataset_index = vec_idx - dataset_offset;
+                            if (dataset_index >= num_dataset_vectors) {
+                                std::cerr << "\n[ERROR] Dataset index out of range: runbook vec_idx="
+                                          << vec_idx << " maps to file index " << dataset_index
+                                          << " but dataset has only " << num_dataset_vectors
+                                          << " vectors (check --dataset-offset and --dataset path)"
+                                          << std::endl;
+                                should_stop.store(true, std::memory_order_relaxed);
+                                operation_failed = true;
+                                continue;
+                            }
                             std::stringstream sql;
                             sql << "INSERT INTO " << table_name << " (id, vec) VALUES ("
-                                << row_id << "," << vector_to_sql(dataset + dataset_index * dim, dim)
+                                << vec_idx << "," << vector_to_sql(dataset + dataset_index * dim, dim)
                                 << ") ON CONFLICT (id) DO NOTHING";
                             PGresult* res = PQexec(conn, sql.str().c_str());
                             if (PQresultStatus(res) == PGRES_COMMAND_OK) {
@@ -943,9 +954,9 @@ public:
                             PQclear(res);
                         }
                         else if (step_info.op == "delete") {
-                            size_t row_id = step_info.start + item_idx;
+                            size_t vec_idx = step_info.start + item_idx;
                             std::stringstream sql;
-                            sql << "DELETE FROM " << table_name << " WHERE id = " << row_id;
+                            sql << "DELETE FROM " << table_name << " WHERE id = " << vec_idx;
                             PGresult* res = PQexec(conn, sql.str().c_str());
                             if (PQresultStatus(res) == PGRES_COMMAND_OK) {
                                 char* tuples = PQcmdTuples(res);
@@ -1151,7 +1162,7 @@ void print_usage(const char* prog_name) {
     std::cerr << "\nOptional arguments:" << std::endl;
     std::cerr << "  --gt-dir <path>             Ground truth directory (default: ./ground_truth)" << std::endl;
     std::cerr << "  --table-name <name>         Table name (default: turing10m)" << std::endl;
-    std::cerr << "  --dataset-offset <n>        Offset added to vec_idx for insert/delete (default: 0)" << std::endl;
+    std::cerr << "  --dataset-offset <n>        Base logical index of loaded dataset file; file index = runbook vec_idx - n (default: 0)" << std::endl;
     std::cerr << "  --start-step <num>          First step to process (1-based, default: process all)" << std::endl;
     std::cerr << "  --end-step <num>            Last step to process (1-based, default: process all)" << std::endl;
     std::cerr << "  --build-index-before <num>  Create index before this step (1-based, default: auto)" << std::endl;
@@ -1358,7 +1369,7 @@ int main(int argc, char** argv) {
 
         // Execute test
         test.execute_runbook(config.RUNBOOK_PATH, config.DATASET_NAME,
-                             dataset.data(), queries.data(), num_queries,
+                             dataset.data(), num_vectors, queries.data(), num_queries,
                              start_step, end_step, build_index_before,
                              mixed_mode_start, mixed_size);
 

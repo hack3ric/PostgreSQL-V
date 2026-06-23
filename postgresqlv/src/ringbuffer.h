@@ -154,6 +154,12 @@ typedef struct {
     volatile int result_count;
     Size result_size;
     volatile int maint_status; /* maintenance result: 0=OK, 1=RETRY */
+    volatile int maint_done;   /* maintenance completion flag: 0=pending, 1=done.
+                                * Set by the worker ONLY when the task truly
+                                * finishes; the requesting backend polls this
+                                * instead of trusting a bare latch wakeup, since
+                                * MyLatch is set for many unrelated reasons
+                                * (statement_timeout / query-cancel signals). */
 } VectorSearchResultData;
 // followed by result data (may include both vids and distances)
 typedef VectorSearchResultData* VectorSearchResult;

@@ -37,6 +37,8 @@
 #undef atomic_compare_exchange_weak
 #endif
 
+#include <exception>
+
 #include "knowhere/comp/index_param.h"
 #include "lsmindex.h"
 #include "lsm_segment.h"
@@ -1083,41 +1085,57 @@ BruteForceSearch(const float* vectors, const float* query_vector, const uint8_t 
     // // Timing instrumentation
     // auto start_time = std::chrono::high_resolution_clock::now();
 
-    auto query_dataset = knowhere::GenDataSet(1, dim, query_vector);
-    auto base_dataset = knowhere::GenDataSet(count, dim, vectors);
-    knowhere::Json conf;
-    conf[knowhere::meta::TOPK] = k;
-    conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
-    conf[knowhere::meta::DIM] = dim;
-    conf[knowhere::meta::RADIUS] = 10.0;
-    
-    // generate bitset view
-    knowhere::BitsetView bitset_view(bitmap, count);
-    auto res = knowhere::BruteForce::Search<knowhere::fp32>(base_dataset, query_dataset, conf, bitset_view);
-    
     // Convert knowhere::Dataset to topKVector
-    // Note: This function is called from backend threads, so palloc is safe
+    // Note: This function is called from backend threads, so palloc is safe.
+    // Allocate the result holder before the search so it is always valid even
+    // if the knowhere call below fails.
     topKVector* topk_result = (topKVector *) palloc(sizeof(topKVector));
-    
-    if (res.has_value()) {
-        const int64_t* ids = res.value()->GetIds();
-        const float* distances = res.value()->GetDistance();
-        int actual_k = Min(k, count);
-        
-        topk_result->num_results = actual_k;
-        topk_result->distances = (float *) palloc(sizeof(float) * actual_k);
-        topk_result->vids = (int64_t *) palloc(sizeof(int64_t) * actual_k);
-        
-        // Copy results
-        for (int i = 0; i < actual_k; i++) {
-            topk_result->distances[i] = distances[i];
-            topk_result->vids[i] = ids[i];
+    topk_result->num_results = 0;
+    topk_result->distances = nullptr;
+    topk_result->vids = nullptr;
+
+    /*
+     * Knowhere/Faiss can throw C++ exceptions (bad_alloc, internal errors). This
+     * is an extern "C" function called from PG's C search path, and letting an
+     * exception unwind across that boundary is undefined behaviour that aborts
+     * the whole process. Catch everything and convert it to a normal Postgres
+     * error: search_lsm_index runs this under HOLD_INTERRUPTS() inside a
+     * PG_TRY/PG_CATCH, so the elog(ERROR) longjmp travels only through plain C
+     * frames, the caller releases its memtable ref_counts, and just this one
+     * query fails instead of crashing the cluster.
+     */
+    try {
+        auto query_dataset = knowhere::GenDataSet(1, dim, query_vector);
+        auto base_dataset = knowhere::GenDataSet(count, dim, vectors);
+        knowhere::Json conf;
+        conf[knowhere::meta::TOPK] = k;
+        conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+        conf[knowhere::meta::DIM] = dim;
+        conf[knowhere::meta::RADIUS] = 10.0;
+
+        // generate bitset view
+        knowhere::BitsetView bitset_view(bitmap, count);
+        auto res = knowhere::BruteForce::Search<knowhere::fp32>(base_dataset, query_dataset, conf, bitset_view);
+
+        if (res.has_value()) {
+            const int64_t* ids = res.value()->GetIds();
+            const float* distances = res.value()->GetDistance();
+            int actual_k = Min(k, count);
+
+            topk_result->num_results = actual_k;
+            topk_result->distances = (float *) palloc(sizeof(float) * actual_k);
+            topk_result->vids = (int64_t *) palloc(sizeof(int64_t) * actual_k);
+
+            // Copy results
+            for (int i = 0; i < actual_k; i++) {
+                topk_result->distances[i] = distances[i];
+                topk_result->vids[i] = ids[i];
+            }
         }
-    } else {
-        // Handle error case - return empty result
-        topk_result->num_results = 0;
-        topk_result->distances = nullptr;
-        topk_result->vids = nullptr;
+    } catch (const std::exception& e) {
+        elog(ERROR, "[BruteForceSearch] knowhere search failed: %s", e.what());
+    } catch (...) {
+        elog(ERROR, "[BruteForceSearch] knowhere search failed: unknown C++ exception");
     }
 
     // // TODO: for evaluation
