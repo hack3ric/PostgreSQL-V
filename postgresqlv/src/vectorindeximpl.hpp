@@ -103,6 +103,10 @@ void ConcurrentVectorSearchOnSegments(
     struct PGPROC* client_proc,
     FlushedSegmentPool* pool);  // For decrementing reference counts
 
+/* Configure native pools once in PostgreSQL-V's VectorIndexWorker process. */
+void ConfigurePostgresqlVNativeThreadPools(int search_threads,
+                                           int build_threads);
+
 #ifdef __cplusplus
 }
 #endif

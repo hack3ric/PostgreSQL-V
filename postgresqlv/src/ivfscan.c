@@ -174,7 +174,7 @@ ivfflatgettuple(IndexScanDesc scan, ScanDirection dir)
 		// IvfflatBench("GetScanLists", GetScanLists(scan, value));
 		// IvfflatBench("GetScanItems", GetScanItems(scan, value));
 		// conduct ivfflat search
-		Vector *query_vector = (Vector *) PointerGetDatum(value);
+		Vector *query_vector = (Vector *) DatumGetPointer(value);
 		// FIXME: how are we going to set top_k?
 		int top_k = 100;
 		so->topkTuples = search_lsm_index(scan->indexRelation, query_vector->x, top_k, so->probes);

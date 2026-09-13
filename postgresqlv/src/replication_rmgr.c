@@ -317,6 +317,9 @@ redo_index_create(XLogReaderState *r)
     fake_lsm.index_type = (IndexType) rec->index_type;
     fake_lsm.dim        = rec->dim;
     fake_lsm.elem_size  = rec->elem_size;
+    /* Older replication records do not encode HNSW options. */
+    fake_lsm.hnsw_m = 32;
+    fake_lsm.hnsw_ef_construction = 200;
     write_lsm_index_metadata(&fake_lsm);
 
     /*

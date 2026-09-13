@@ -1,4 +1,5 @@
 #include "postgres.h"
+#include <math.h>
 #include "access/xlog.h"      /* RecoveryInProgress */
 #include "postmaster/postmaster.h"
 #include "postmaster/bgworker.h"
@@ -101,10 +102,11 @@ prepare_for_flushing(LSMIndex lsm, int slot_idx, ConcurrentMemTable mt, PrepareF
     prep->valid_rows = valid;
     prep->index_type = HNSW;
 
-    // build hnsw type index on the segment
-    // TODO: tune the parameters
+    // Segment maintenance must preserve the index's original HNSW settings.
     void *vector_index;
-    IndexBuild(prep->index_type, mt, valid, &vector_index, 32, 200, (int)sqrt(MEMTABLE_MAX_CAPACITY));
+    IndexBuild(prep->index_type, mt, valid, &vector_index,
+               (int)lsm->hnsw_m, (int)lsm->hnsw_ef_construction,
+               (int)sqrt(mt->capacity));
 
     // serialize and flush the flat vector index
     IndexSerialize(vector_index, &prep->index_bin);

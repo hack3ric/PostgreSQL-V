@@ -14,6 +14,14 @@ calculate_ring_buffer_shmem_size()
     Size task_stride = MAXALIGN(sizeof(TaskSlot));
     size = add_size(size, mul_size(task_stride, (Size)MaxBackends));
 
+    /*
+     * ring_buffer_init() creates all three named shared-memory objects.  They
+     * share the extension's RequestAddinShmemSpace reservation, so account
+     * for the two per-backend pools here as well.
+     */
+    size = add_size(size, calculate_vector_search_task_pool_size());
+    size = add_size(size, calculate_vector_search_result_pool_size());
+
     return size;
 }
 

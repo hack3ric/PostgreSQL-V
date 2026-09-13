@@ -658,6 +658,9 @@ write_lsm_index_metadata(LSMIndex lsm)
 		elog(ERROR, "[flush_lsm_index_metadata] Failed to write dim to %s", tmp_path);
 	if (fwrite(&lsm->elem_size, sizeof(uint32_t), 1, fp) != 1)
 		elog(ERROR, "[flush_lsm_index_metadata] Failed to write elem_size to %s", tmp_path);
+	if (fwrite(&lsm->hnsw_m, sizeof(uint32_t), 1, fp) != 1 ||
+		fwrite(&lsm->hnsw_ef_construction, sizeof(uint32_t), 1, fp) != 1)
+		elog(ERROR, "[flush_lsm_index_metadata] Failed to write HNSW options to %s", tmp_path);
 
 	/* Flush file buffers to disk */
 	fflush(fp);
@@ -682,7 +685,9 @@ write_lsm_index_metadata(LSMIndex lsm)
 }
 
 bool
-read_lsm_index_metadata(Oid indexRelId, IndexType *index_type, uint32_t *dim, uint32_t *elem_size)
+read_lsm_index_metadata(Oid indexRelId, IndexType *index_type, uint32_t *dim,
+					uint32_t *elem_size, uint32_t *hnsw_m,
+					uint32_t *hnsw_ef_construction)
 {
 	char metadata_path[MAXPGPATH];
 	get_lsm_metadata_path(metadata_path, sizeof(metadata_path), indexRelId);
@@ -709,6 +714,14 @@ read_lsm_index_metadata(Oid indexRelId, IndexType *index_type, uint32_t *dim, ui
 	{
 		fclose(fp);
 		return false;
+	}
+	/* Metadata written before the adapter did not contain these two fields. */
+	if (fread(hnsw_m, sizeof(uint32_t), 1, fp) != 1 ||
+		fread(hnsw_ef_construction, sizeof(uint32_t), 1, fp) != 1)
+	{
+		*hnsw_m = 32;
+		*hnsw_ef_construction = 200;
+		clearerr(fp);
 	}
 	
 	fclose(fp);

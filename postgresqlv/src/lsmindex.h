@@ -25,15 +25,6 @@ typedef enum IndexType
 #define IS_DISK_BASED 0
 #endif
 
-// Set this to 1 to enable 2-phase mmap cold-start on IndexLoadTaskType:
-//   phase 1 = mmap-load all segments quickly → signal backend immediately;
-//   phase 2 = background upgrade each segment to full in-memory.
-// Set to 0 to skip mmap and fully load all segments before signaling.
-// The on-disk format is mmap-compatible regardless of this flag.
-#ifndef ENABLE_MMAP_COLDSTART
-#define ENABLE_MMAP_COLDSTART 1
-#endif
-
 // FIXME: find a better way to manage memtables' memory
 // memtable
 #define MEMTABLE_MAX_CAPACITY 50000 // 50K
@@ -52,6 +43,20 @@ typedef enum IndexType
 #define MAX_SEGMENTS_SLOT_NUM 1024 // max number of segments in buffer
 #define INDEX_BUF_SIZE 8
 #define START_SEGMENT_ID 3
+
+/*
+ * PostgreSQL-V's static shared-memory layout is intentionally bounded by the
+ * constants above. These postmaster settings select how much of that reserved
+ * capacity an index uses and how much concurrency its worker owns. Keeping
+ * the maximum layout fixed avoids changing offsets in existing shared memory.
+ */
+extern int postgresqlv_search_candidates;
+extern int postgresqlv_search_worker_threads;
+extern int postgresqlv_maintenance_worker_threads;
+extern int postgresqlv_merge_worker_threads;
+extern int postgresqlv_memtable_capacity;
+extern double postgresqlv_deletion_rebuild_ratio;
+extern bool postgresqlv_mmap_cold_start;
 
 // locks
 #define LSM_MEMTABLE_LWTRANCHE "lsm_memtable_rwlock"
@@ -83,7 +88,6 @@ typedef struct ConcurrentMemTableData {
     // The metadata of the vector 
     uint32_t dim;
     uint32_t elem_size; // the size of each dimension
-
     int64_t tids[MEMTABLE_MAX_CAPACITY];
     uint8_t bitmap[MEMTABLE_BITMAP_SIZE];   // 1 = "masked out / exclude this id", and 0 = keep
     uint8_t ready[MEMTABLE_MAX_CAPACITY];   // 0 = not ready, 1 = ready
@@ -131,6 +135,8 @@ typedef struct MemtableBuffer
 
 extern MemtableBuffer *SharedMemtableBuffer;
 
+Size calculate_lsm_index_shmem_size(void);
+
 typedef struct LSMIndexData
 {
     Oid indexRelId;
@@ -138,6 +144,9 @@ typedef struct LSMIndexData
     IndexType index_type; // IVFFLAT or HNSW
     uint32_t dim;
     uint32_t elem_size; // the size of each dimension
+    /* Persisted construction settings used for every flushed/rebuilt HNSW segment. */
+    uint32_t hnsw_m;
+    uint32_t hnsw_ef_construction;
     pg_atomic_uint32 next_segment_id;
 
     // // flushed segments
@@ -303,7 +312,9 @@ typedef struct SegmentFileInfo
 int scan_segment_metadata_files(Oid indexRelId, SegmentFileInfo *files, int max_files);
 void flush_segment_to_disk(Oid indexRelId, PrepareFlushMeta prep);
 void write_lsm_index_metadata(LSMIndex lsm);
-bool read_lsm_index_metadata(Oid indexRelId, IndexType *index_type, uint32_t *dim, uint32_t *elem_size);
+bool read_lsm_index_metadata(Oid indexRelId, IndexType *index_type, uint32_t *dim,
+                             uint32_t *elem_size, uint32_t *hnsw_m,
+                             uint32_t *hnsw_ef_construction);
 bool read_lsm_segment_metadata(Oid indexRelId, SegmentId start_sid, SegmentId end_sid, uint32_t version,
 					  SegmentId *out_start_sid, SegmentId *out_end_sid, uint32_t *valid_rows, IndexType *index_type);
 uint32_t find_latest_segment_version(Oid indexRelId, SegmentId start_sid, SegmentId end_sid);

@@ -49,7 +49,7 @@ update_pool_stats(FlushedSegmentPool *pool, IndexType index_type, uint32_t vec_c
     uint32_t d = (uint32_t)delta;  /* -1 becomes UINT32_MAX; unsigned add wraps correctly */
     if (index_type == FLAT)
         pg_atomic_fetch_add_u32(&pool->flat_count, d);
-    if (vec_count <= MEMTABLE_MAX_CAPACITY)
+    if (vec_count <= (uint32_t)postgresqlv_memtable_capacity)
         pg_atomic_fetch_add_u32(&pool->memtable_capacity_le_count, d);
     if (vec_count <= THRESHOLD_SMALL_SEGMENT_SIZE)
         pg_atomic_fetch_add_u32(&pool->small_segment_le_count, d);
@@ -643,5 +643,4 @@ load_and_set_segment(Oid indexRelId, uint32_t segment_idx, FlushedSegment segmen
     }
     pg_write_barrier();
 }
-
 

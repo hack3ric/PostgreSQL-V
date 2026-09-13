@@ -5,13 +5,6 @@
 #include "storage/proc.h"   
 #include "ringbuffer.h"
 
-/* Merge scheduling constants (formerly in lsm_merge_worker.h) */
-#ifndef MERGE_WORKERS_COUNT
-#define MERGE_WORKERS_COUNT              2
-#endif
-#ifndef MERGE_DELETION_RATIO_THRESHOLD
-#define MERGE_DELETION_RATIO_THRESHOLD   0.3f
-#endif
 #ifndef MAX_SEGMENTS_SIZE
 #define MAX_SEGMENTS_SIZE                2000000
 #endif

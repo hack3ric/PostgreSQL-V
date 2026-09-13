@@ -115,8 +115,10 @@
 #include "knowhere/binaryset.h"
 #include "simd/hook.h"
 #include "knowhere/comp/brute_force.h"
-#include "knowhere/comp/thread_pool.h"
-#include "knowhere/comp/local_file_manager.h"
+#include "knowhere/comp/knowhere_config.h"
+#include "filemanager/impl/LocalFileManager.h"
+#include <cblas.h>
+#include <omp.h>
 #include <atomic>
 #include <memory>
 #include <thread>
@@ -259,6 +261,8 @@ extern "C" int
 HnswIndexInit(int dimension, int M, int efConstruction, void** hnswIndexPtr)
 {
     elog(DEBUG1, "enter HnswIndexInit, M = %d, efConstruction = %d", M, efConstruction);
+    ConfigurePostgresqlVNativeThreadPools(postgresqlv_search_worker_threads,
+                                          postgresqlv_maintenance_worker_threads);
 
     auto version = knowhere::Version::GetCurrentVersion().VersionNumber();
     auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
@@ -316,7 +320,7 @@ DiskANNIndexInit(int dimension, void** diskannIndexPtr)
     elog(DEBUG1, "enter DiskANNIndexInit, dimension = %d", dimension);
 
     auto version = knowhere::Version::GetCurrentVersion().VersionNumber();
-    std::shared_ptr<knowhere::FileManager> file_manager = std::make_shared<knowhere::LocalFileManager>();
+    std::shared_ptr<milvus::FileManager> file_manager = std::make_shared<milvus::LocalFileManager>();
     auto diskann_index_pack = knowhere::Pack(file_manager);
     auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(
         knowhere::IndexEnum::INDEX_DISKANN, version, diskann_index_pack).value();
@@ -438,6 +442,14 @@ IndexBuild(IndexType type, ConcurrentMemTable mt, uint32_t valid_rows, void** in
 {
     elog(DEBUG1, "enter IndexBuild, type = %d, relation = %d, segment id = %d, valid_rows = %d, M = %d, efConstruction = %d, lists = %d",
          type, mt->rel, mt->memtable_id, valid_rows, M, efConstruction, lists);
+
+    /*
+     * Flush and merge work calls IndexBuild directly in LSMBackgroundWorker,
+     * bypassing HnswIndexInit().  Configure it before IndexFactory can lazily
+     * create Knowhere's host-sized global pools in that process.
+     */
+    ConfigurePostgresqlVNativeThreadPools(postgresqlv_search_worker_threads,
+                                          postgresqlv_maintenance_worker_threads);
     
     // DiskANN is not supported in IndexBuild (used for REBUILD_FLAT which should use HNSW instead)
     if (type == DISKANN)
@@ -513,6 +525,10 @@ static topKVector*
 VectorIndexSearchImpl(IndexType type, void* indexPtr, const knowhere::BitsetView& bitset_view, uint32_t count, const float* query_vector, int k, int efs_nprobe)
 {
     // fprintf(stderr, "enter VectorIndexSearchImpl, type = %d, index_ptr = %p, count = %d, query_vector = %p, k = %d, efs_nprobe = %d\n", type, indexPtr, count, query_vector, k, efs_nprobe);
+
+    // This is reached from SQL backends as well as VectorIndexWorker.
+    ConfigurePostgresqlVNativeThreadPools(postgresqlv_search_worker_threads,
+                                          postgresqlv_maintenance_worker_threads);
 
     knowhere::Index<knowhere::IndexNode> *index = static_cast<knowhere::Index<knowhere::IndexNode>*>(indexPtr);
 
@@ -909,7 +925,7 @@ IndexLoadAndSave(const char* path, IndexType index_type, void** indexPtr, bool u
         }
         case DISKANN:
         {
-            std::shared_ptr<knowhere::FileManager> file_manager = std::make_shared<knowhere::LocalFileManager>();
+            std::shared_ptr<milvus::FileManager> file_manager = std::make_shared<milvus::LocalFileManager>();
             auto diskann_index_pack = knowhere::Pack(file_manager);
             auto kindex = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(
                 knowhere::IndexEnum::INDEX_DISKANN, version, diskann_index_pack).value();
@@ -1066,7 +1082,8 @@ ComputeMultipleDistances(const void *vectors, uint32_t vector_num, uint32_t dim,
   Assert(vectors != NULL);
   Assert(query_vector != NULL);
 
-  faiss::fvec_L2sqr_ny(distances, query_vector, (float *)vectors, dim, vector_num);
+  faiss::cppcontrib::knowhere::fvec_L2sqr_ny(
+      distances, query_vector, (float *)vectors, dim, vector_num);
 }
 
 extern "C" float
@@ -1075,12 +1092,17 @@ ComputeDistance(const float *a, const float *b, uint32_t dim)
     Assert(a != NULL);
     Assert(b != NULL);
 
-    return faiss::fvec_L2sqr(a, b, dim);
+    return faiss::cppcontrib::knowhere::fvec_L2sqr(a, b, dim);
 }
 
 extern "C" topKVector*
 BruteForceSearch(const float* vectors, const float* query_vector, const uint8_t *bitmap, int count, int k, int dim)
 {
+    /* Growing-memtable search runs in SQL backends, which otherwise lazily
+     * create Knowhere's process-local pools from hardware_concurrency(). */
+    ConfigurePostgresqlVNativeThreadPools(postgresqlv_search_worker_threads,
+                                          postgresqlv_maintenance_worker_threads);
+
     // // TODO: for evaluation
     // // Timing instrumentation
     // auto start_time = std::chrono::high_resolution_clock::now();
@@ -1573,11 +1595,39 @@ search_segment_task(ConcurrentSearchContext* ctx, uint32_t seg_idx) {
     }
 }
 
+extern "C" void
+ConfigurePostgresqlVNativeThreadPools(int search_threads, int build_threads)
+{
+    static int configured_search_threads = 0;
+    static int configured_build_threads = 0;
+
+    if (configured_search_threads != 0) {
+        if (configured_search_threads != search_threads ||
+            configured_build_threads != build_threads) {
+            elog(ERROR, "PostgreSQL-V native pools cannot be resized in-process");
+        }
+        return;
+    }
+
+    /* The postmaster GUC validators guarantee each requested size is >= 1. */
+    knowhere::KnowhereConfig::SetSearchThreadPoolSize(
+        static_cast<size_t>(search_threads));
+    knowhere::KnowhereConfig::SetBuildThreadPoolSize(
+        static_cast<size_t>(build_threads));
+
+    /* Avoid nested OpenMP/BLAS teams multiplying PostgreSQL-V workers. */
+    omp_set_dynamic(0);
+    omp_set_num_threads(1);
+    openblas_set_num_threads(1);
+    configured_search_threads = search_threads;
+    configured_build_threads = build_threads;
+}
+
 // Global singleton executor for outer search fan-out
 // This is separate from Knowhere's internal thread pool to avoid conflicts
 static folly::CPUThreadPoolExecutor& GetPgOuterSearchExecutor() {
     static folly::CPUThreadPoolExecutor exec(
-        /*numThreads=*/std::max(1u, std::thread::hardware_concurrency() / 2),
+        /*numThreads=*/static_cast<size_t>(postgresqlv_search_worker_threads),
         std::make_shared<folly::NamedThreadFactory>("pg_outer_search")
     );
     return exec;

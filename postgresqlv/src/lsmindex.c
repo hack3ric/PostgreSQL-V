@@ -21,6 +21,7 @@
 #include "access/table.h"
 #include "access/tableam.h"
 #include "vector.h"
+#include "hnsw.h"
 #include "access/heapam.h"
 #include "portability/instr_time.h"
 #include "miscadmin.h"
@@ -61,6 +62,25 @@ get_vector_storage_dir(void)
 LSMIndexBuffer *SharedLSMIndexBuffer = NULL;
 IndexRecoveryCoordinator *SharedIndexRecoveryCoordinator = NULL;
 MemtableBuffer *SharedMemtableBuffer = NULL;
+
+/*
+ * The extension initialises several separately named objects in the shared
+ * add-in area.  Keep a bounded margin for PostgreSQL's shared-memory index
+ * and allocator bookkeeping so a deliberately small max_connections setting
+ * does not leave the final Memtable Buffer allocation just short of space.
+ */
+#define LSM_SHMEM_ALLOCATION_MARGIN (8 * 1024 * 1024)
+
+Size
+calculate_lsm_index_shmem_size(void)
+{
+    Size size = MAXALIGN(sizeof(LSMIndexBuffer));
+
+    size = add_size(size, MAXALIGN(sizeof(MemtableBuffer)));
+    size = add_size(size, MAXALIGN(sizeof(IndexRecoveryCoordinator)));
+    size = add_size(size, LSM_SHMEM_ALLOCATION_MARGIN);
+    return size;
+}
 
 // helper functions for memtables
 ConcurrentMemTable
@@ -127,7 +147,6 @@ lsm_index_buffer_shmem_initialize()
             pg_atomic_init_u32(&SharedLSMIndexBuffer->slots[i].state_error, 0);
             SharedLSMIndexBuffer->slots[i].request_db_oid    = InvalidOid;
             SharedLSMIndexBuffer->slots[i].request_db_userid = InvalidOid;
-            LWLockInitialize(&SharedLSMIndexBuffer->slots[i].lsmIndex.mt_lock, LSM_MEMTABLE_LWTRANCHE_ID);
             SharedLSMIndexBuffer->slots[i].lsmIndex.mt_lock = &mt_tranche[i].lock;
             LWLockInitialize(&flushed_release_tranche[i].lock, LSM_FLUSHED_RELEASE_LWTRANCHE_ID);
             SharedLSMIndexBuffer->slots[i].lsmIndex.flushed_release_lock = &flushed_release_tranche[i].lock;
@@ -139,7 +158,7 @@ lsm_index_buffer_shmem_initialize()
         }
     }
     // initialize SharedMemtableBuffer
-    Pointer base = (ConcurrentMemTable *)
+    Pointer base =
         ShmemInitStruct("Memtable Buffer",
                         MAXALIGN(sizeof(MemtableBuffer)),
                         &found);
@@ -453,7 +472,7 @@ register_and_set_memtable(LSMIndex lsm, Relation index, bool is_recovery, Segmen
     // calculate capacity
     Size vecbytes = (Size)mt->dim * (Size)mt->elem_size;
     uint32 cap_by_bytes = (uint32)(MEMTABLE_VECTOR_ARRAY_SIZE_BYTES / vecbytes);
-    uint32 cap = Min(cap_by_bytes, (uint32)MEMTABLE_MAX_CAPACITY);
+    uint32 cap = Min(cap_by_bytes, (uint32)postgresqlv_memtable_capacity);
     mt->capacity = cap;
     pg_atomic_write_u32(&mt->current_size, 0);
     pg_atomic_write_u32(&mt->ready_cnt, 0);
@@ -596,6 +615,9 @@ build_lsm_index(IndexType type, Relation index, void *vector_index, int64_t *tid
     slot->lsmIndex.index_type = type;
     slot->lsmIndex.dim = dim;
     slot->lsmIndex.elem_size = elem_size;
+    slot->lsmIndex.hnsw_m = type == HNSW ? HnswGetM(index) : 32;
+    slot->lsmIndex.hnsw_ef_construction =
+        type == HNSW ? HnswGetEfConstruction(index) : 200;
     pg_atomic_write_u32(&slot->lsmIndex.next_segment_id, START_SEGMENT_ID + 1);
 
     /*
@@ -651,7 +673,7 @@ build_lsm_index(IndexType type, Relation index, void *vector_index, int64_t *tid
     slot->lsmIndex.memtable_count = 0;
     pg_atomic_init_u32(&slot->lsmIndex.flushed_not_released_count, 0);
     pg_atomic_init_u32(&slot->lsmIndex.releasing_in_progress, 0);
-    int mt_idx = allocate_new_growing_memtable(&slot->lsmIndex, index, false, NULL);
+    int mt_idx = allocate_new_growing_memtable(&slot->lsmIndex, index, false, 0);
     slot->lsmIndex.growing_memtable_idx = mt_idx;
     slot->lsmIndex.growing_memtable_id = MT_FROM_SLOTIDX(mt_idx)->memtable_id;
     /*
@@ -732,8 +754,9 @@ recover_lsm_index_internal(Oid index_relid, uint32_t slot_idx)
 
     // Read LSM index metadata from disk
     IndexType index_type;
-    uint32_t dim, elem_size;
-    if (!read_lsm_index_metadata(index_relid, &index_type, &dim, &elem_size))
+    uint32_t dim, elem_size, hnsw_m, hnsw_ef_construction;
+    if (!read_lsm_index_metadata(index_relid, &index_type, &dim, &elem_size,
+                                 &hnsw_m, &hnsw_ef_construction))
     {
         elog(ERROR, "[recover_lsm_index_internal] Failed to read LSM index metadata for index %u", index_relid);
         Assert(false);
@@ -743,6 +766,8 @@ recover_lsm_index_internal(Oid index_relid, uint32_t slot_idx)
     lsm->index_type = index_type;
     lsm->dim = dim;
     lsm->elem_size = elem_size;
+    lsm->hnsw_m = hnsw_m;
+    lsm->hnsw_ef_construction = hnsw_ef_construction;
     
     // Scan segment metadata files to get all segments
     SegmentFileInfo files[MAX_SEGMENTS_COUNT];
@@ -1626,7 +1651,7 @@ rotate_growing_memtable(LSMIndex lsm, Relation index, bool need_enqueue)
 
     LWLockRelease(lsm->mt_lock);
 
-    int new_idx = allocate_new_growing_memtable(lsm, index, false, NULL);
+    int new_idx = allocate_new_growing_memtable(lsm, index, false, 0);
 
     if (need_enqueue)
         enqueue_sealed_memtable(lsm, cur_idx);

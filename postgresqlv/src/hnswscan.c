@@ -152,9 +152,9 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		// UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
 
 		// conduct hnsw search
-		Vector *query_vector = (Vector *) PointerGetDatum(value);
-		// FIXME: how are we going to set top_k?
-		int top_k = 150;
+		Vector *query_vector = (Vector *) DatumGetPointer(value);
+		/* Bounded by MAX_TOPK at GUC registration, so ring-buffer storage is safe. */
+		int top_k = postgresqlv_search_candidates;
 
 		so->topkTuples = search_lsm_index(scan->indexRelation, query_vector->x, top_k, hnsw_ef_search);
 		so->topkTuplesIdx = 0;	

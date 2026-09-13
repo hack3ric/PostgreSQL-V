@@ -33,6 +33,7 @@
 #include "replication_rmgr.h"
 #include "replication_gucs.h"
 #include "segment_fetcher.h"
+#include "ringbuffer.h"
 
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
@@ -57,6 +58,14 @@ static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 #if PG_VERSION_NUM >= 150000
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 #endif
+
+int postgresqlv_search_candidates = 150;
+int postgresqlv_search_worker_threads = 1;
+int postgresqlv_maintenance_worker_threads = 4;
+int postgresqlv_merge_worker_threads = 2;
+int postgresqlv_memtable_capacity = MEMTABLE_MAX_CAPACITY;
+double postgresqlv_deletion_rebuild_ratio = 0.30;
+bool postgresqlv_mmap_cold_start = true;
 
 static void
 shmem_startup(void)
@@ -90,8 +99,7 @@ vector_shmem_request(void)
 	RequestNamedLWLockTranche(LSM_INDEX_BUFFER_LWTRANCHE, 1);
 
 	RequestAddinShmemSpace(calculate_ring_buffer_shmem_size());
-	RequestAddinShmemSpace(4000000000L); // 2GB
-	RequestAddinShmemSpace(MAXALIGN(sizeof(IndexRecoveryCoordinator)));
+	RequestAddinShmemSpace(calculate_lsm_index_shmem_size());
 }
 
 /*
@@ -129,6 +137,36 @@ _PG_init(void)
         "",
         PGC_POSTMASTER,
         0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("postgresqlv.search_candidates",
+        "Candidates retrieved by the PostgreSQL-V HNSW scan before SQL LIMIT.",
+        NULL, &postgresqlv_search_candidates, 150, 1, MAX_TOPK,
+        PGC_USERSET, 0, NULL, NULL, NULL);
+    DefineCustomIntVariable("postgresqlv.search_worker_threads",
+        "Threads used by PostgreSQL-V's outer segment-search executor.",
+        NULL, &postgresqlv_search_worker_threads, 1, 1, 1024,
+        PGC_POSTMASTER, 0, NULL, NULL, NULL);
+    DefineCustomIntVariable("postgresqlv.maintenance_worker_threads",
+        "Threads used for PostgreSQL-V flush, load, and maintenance tasks.",
+        NULL, &postgresqlv_maintenance_worker_threads, 4, 1, 1024,
+        PGC_POSTMASTER, 0, NULL, NULL, NULL);
+    DefineCustomIntVariable("postgresqlv.merge_worker_threads",
+        "Threads used for PostgreSQL-V segment merge and rebuild tasks.",
+        NULL, &postgresqlv_merge_worker_threads, 2, 1, 1024,
+        PGC_POSTMASTER, 0, NULL, NULL, NULL);
+    DefineCustomIntVariable("postgresqlv.memtable_capacity",
+        "Maximum vectors accepted by a PostgreSQL-V memtable before rotation.",
+        NULL, &postgresqlv_memtable_capacity, MEMTABLE_MAX_CAPACITY, 1,
+        MEMTABLE_MAX_CAPACITY, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+    DefineCustomRealVariable("postgresqlv.deletion_rebuild_ratio",
+        "Deleted-vector ratio that schedules PostgreSQL-V segment rebuild.",
+        NULL, &postgresqlv_deletion_rebuild_ratio, 0.30, 0.0, 1.0,
+        PGC_POSTMASTER, 0, NULL, NULL, NULL);
+    DefineCustomBoolVariable("postgresqlv.mmap_cold_start",
+        "Use PostgreSQL-V's mmap-first segment loading path after restart.",
+        NULL, &postgresqlv_mmap_cold_start, true,
+        PGC_POSTMASTER, 0, NULL, NULL, NULL);
+    MarkGUCPrefixReserved("postgresqlv");
 
     /* Ensure the storage base directory exists. Idempotent. */
     {

@@ -106,8 +106,6 @@ wait_for_slot_queryable(int lsm_idx)
 static volatile sig_atomic_t got_sighup = false;
 static volatile sig_atomic_t got_sigterm = false;
 
-// Thread pool for maintenance tasks
-#define MAINTENANCE_THREAD_POOL_SIZE 4
 // Must be larger than MAX_SEGMENTS_COUNT to absorb one upgrade task per segment
 // plus headroom for regular tasks.
 #define MAINTENANCE_TASK_QUEUE_SIZE 1152
@@ -147,7 +145,7 @@ typedef struct MaintenanceTask {
 } MaintenanceTask;
 
 typedef struct MaintenanceThreadPool {
-    pthread_t threads[MAINTENANCE_THREAD_POOL_SIZE];
+    pthread_t *threads;
     pthread_mutex_t queue_mutex;
     pthread_cond_t queue_cond;
     MaintenanceTask *task_queue_head;
@@ -163,7 +161,7 @@ static MaintenanceThreadPool *maintenance_pool = NULL;
  * Threads wake on a condition variable, scan FlushedSegmentPool themselves,
  * and update it directly without going through the ring buffer. */
 typedef struct MergeThreadPool {
-    pthread_t threads[MERGE_WORKERS_COUNT];
+    pthread_t *threads;
     pthread_mutex_t mutex;
     pthread_cond_t work_available;
     atomic_int pending_signals;
@@ -495,8 +493,7 @@ maintenance_worker_thread(void *arg)
                 int lsm_idx = load_task->lsm_idx;
                 FlushedSegmentPool *pool_seg;
 
-#if ENABLE_MMAP_COLDSTART
-                {
+                if (postgresqlv_mmap_cold_start) {
                     uint32_t seg_idx;
 
                     // TODO: for debugging
@@ -549,8 +546,7 @@ maintenance_worker_thread(void *arg)
                         fprintf(stderr, "[maintenance_worker] IndexLoadTaskType: phase 2 submitted"
                                 " %d upgrade tasks\n", upgrade_count);
                     }
-                }
-#else
+                } else {
                 // TODO: for debugging
                 fprintf(stderr, "[maintenance_worker] IndexLoadTaskType: fully loading index %u lsm_idx=%d"
                         " (mmap cold-start disabled)\n", index_relid, lsm_idx);
@@ -564,7 +560,7 @@ maintenance_worker_thread(void *arg)
                 fprintf(stderr, "[maintenance_worker] IndexLoadTaskType: full load complete,"
                         " signaling backend pgprocno=%d\n", load_task->backend_pgprocno);
                 client = &ProcGlobal->allProcs[load_task->backend_pgprocno];
-#endif
+                }
                 break;
             }
             case InternalSegmentUpgradeTaskType:
@@ -733,7 +729,14 @@ init_maintenance_thread_pool(void)
     maintenance_pool->task_queue_tail = NULL;
     atomic_init(&maintenance_pool->queue_size, 0);
     atomic_init(&maintenance_pool->shutdown, 0);
-    maintenance_pool->num_threads = MAINTENANCE_THREAD_POOL_SIZE;
+    maintenance_pool->num_threads = postgresqlv_maintenance_worker_threads;
+    maintenance_pool->threads = calloc((size_t)maintenance_pool->num_threads,
+                                       sizeof(*maintenance_pool->threads));
+    if (maintenance_pool->threads == NULL) {
+        free(maintenance_pool);
+        maintenance_pool = NULL;
+        elog(ERROR, "[init_maintenance_thread_pool] Failed to allocate workers");
+    }
     
     pthread_mutex_init(&maintenance_pool->queue_mutex, NULL);
     pthread_cond_init(&maintenance_pool->queue_cond, NULL);
@@ -762,7 +765,14 @@ init_merge_thread_pool(void)
     pthread_cond_init(&merge_pool->work_available, NULL);
     atomic_init(&merge_pool->pending_signals, 0);
     atomic_init(&merge_pool->shutdown, 0);
-    merge_pool->num_threads = MERGE_WORKERS_COUNT;
+    merge_pool->num_threads = postgresqlv_merge_worker_threads;
+    merge_pool->threads = calloc((size_t)merge_pool->num_threads,
+                                 sizeof(*merge_pool->threads));
+    if (merge_pool->threads == NULL) {
+        free(merge_pool);
+        merge_pool = NULL;
+        elog(ERROR, "[init_merge_thread_pool] failed to allocate workers");
+    }
 
     for (int i = 0; i < merge_pool->num_threads; i++)
     {
@@ -772,6 +782,28 @@ init_merge_thread_pool(void)
     }
 
     elog(DEBUG1, "[init_merge_thread_pool] started %d merge threads", merge_pool->num_threads);
+}
+
+static void
+shutdown_maintenance_thread_pool(void)
+{
+    if (maintenance_pool == NULL)
+        return;
+
+    atomic_store(&maintenance_pool->shutdown, 1);
+    pthread_mutex_lock(&maintenance_pool->queue_mutex);
+    pthread_cond_broadcast(&maintenance_pool->queue_cond);
+    pthread_mutex_unlock(&maintenance_pool->queue_mutex);
+
+    for (int i = 0; i < maintenance_pool->num_threads; i++)
+        pthread_join(maintenance_pool->threads[i], NULL);
+
+    pthread_mutex_destroy(&maintenance_pool->queue_mutex);
+    pthread_cond_destroy(&maintenance_pool->queue_cond);
+    free(maintenance_pool->threads);
+    free(maintenance_pool);
+    maintenance_pool = NULL;
+    elog(DEBUG1, "[shutdown_maintenance_thread_pool] maintenance threads joined and cleaned up");
 }
 
 static void
@@ -790,6 +822,7 @@ shutdown_merge_thread_pool(void)
 
     pthread_mutex_destroy(&merge_pool->mutex);
     pthread_cond_destroy(&merge_pool->work_available);
+    free(merge_pool->threads);
     free(merge_pool);
     merge_pool = NULL;
     elog(DEBUG1, "[shutdown_merge_thread_pool] merge threads joined and cleaned up");
@@ -942,9 +975,9 @@ traverse_and_check_priority_pool(int lsm_idx, int priority_type, MergeTaskLocal 
             case 1: /* FLAT → rebuild flat */
                 should_claim = (seg->index_type == FLAT);
                 break;
-            case 2: /* vec_count <= MEMTABLE_MAX_CAPACITY → merge */
+            case 2: /* vec_count <= configured memtable capacity → merge */
                 if (seg->index_type == DISKANN) break;
-                if (seg->vec_count <= MEMTABLE_MAX_CAPACITY &&
+                if (seg->vec_count <= (uint32_t)postgresqlv_memtable_capacity &&
                     choose_adjacent_smaller_pool(pool, cur, &adj) &&
                     pool->flushed_segments[adj].vec_count < MAX_SEGMENTS_SIZE &&
                     seg->vec_count + pool->flushed_segments[adj].vec_count < MAX_SEGMENTS_SIZE)
@@ -952,7 +985,8 @@ traverse_and_check_priority_pool(int lsm_idx, int priority_type, MergeTaskLocal 
                 break;
             case 3: /* high deletion ratio → rebuild deletion */
                 if (seg->vec_count > 0 &&
-                    (float)seg->delete_count / (float)seg->vec_count > MERGE_DELETION_RATIO_THRESHOLD)
+                    (double)seg->delete_count / (double)seg->vec_count >
+                        postgresqlv_deletion_rebuild_ratio)
                     should_claim = true;
                 break;
             case 4: /* vec_count <= THRESHOLD_SMALL_SEGMENT_SIZE → merge */
@@ -1132,7 +1166,10 @@ rebuild_index_pool(MergeTaskLocal *task)
     /* --- Phase 2: build new index from snapshot bitmap (no lock) --- */
     new_index_ptr   = NULL;
     new_index_count = 0;
-    M = 32; efConstruction = 400; lists = 1024;
+    M = (int)SharedLSMIndexBuffer->slots[task->lsm_idx].lsmIndex.hnsw_m;
+    efConstruction = (int)SharedLSMIndexBuffer->slots[task->lsm_idx]
+                         .lsmIndex.hnsw_ef_construction;
+    lists = 1024;
     MergeIndex(old_index_ptr, snapshot_bitmap, (int)seg->vec_count,
                seg->index_type, target_type,
                &new_index_ptr, &new_index_count,
@@ -1309,7 +1346,7 @@ rebuild_index_pool(MergeTaskLocal *task)
     replace_flushed_segments_n(pool, &task->segment_idx0, 1, new_slot_idx);
     if (target_type == FLAT)
         pg_atomic_fetch_add_u32(&pool->flat_count, 1);
-    if ((uint32_t)new_index_count <= MEMTABLE_MAX_CAPACITY)
+    if ((uint32_t)new_index_count <= (uint32_t)postgresqlv_memtable_capacity)
         pg_atomic_fetch_add_u32(&pool->memtable_capacity_le_count, 1);
     if ((uint32_t)new_index_count <= THRESHOLD_SMALL_SEGMENT_SIZE)
         pg_atomic_fetch_add_u32(&pool->small_segment_le_count, 1);
@@ -1619,7 +1656,7 @@ merge_adjacent_segments_pool(MergeTaskLocal *task)
         pg_atomic_fetch_add_u32(&pool->flat_count, 1);
     {
         uint32_t nv = (uint32_t)merged_count;
-        if (nv <= MEMTABLE_MAX_CAPACITY)
+        if (nv <= (uint32_t)postgresqlv_memtable_capacity)
             pg_atomic_fetch_add_u32(&pool->memtable_capacity_le_count, 1);
         if (nv <= THRESHOLD_SMALL_SEGMENT_SIZE)
             pg_atomic_fetch_add_u32(&pool->small_segment_le_count, 1);
@@ -1978,6 +2015,8 @@ vector_index_worker_main(Datum main_arg)
 {
     elog(DEBUG1, "enter vector_index_worker_main");
 
+    ConfigurePostgresqlVNativeThreadPools(postgresqlv_search_worker_threads,
+                                          postgresqlv_maintenance_worker_threads);
 
     init_maintenance_thread_pool();
     if (!RecoveryInProgress())
@@ -2016,6 +2055,7 @@ vector_index_worker_main(Datum main_arg)
         if (rc & WL_POSTMASTER_DEATH)
         {
             shutdown_merge_thread_pool();
+            shutdown_maintenance_thread_pool();
             proc_exit(0);
         }
 
@@ -2023,6 +2063,7 @@ vector_index_worker_main(Datum main_arg)
         if (got_sigterm)
         {
             shutdown_merge_thread_pool();
+            shutdown_maintenance_thread_pool();
             proc_exit(0);
         }
         
