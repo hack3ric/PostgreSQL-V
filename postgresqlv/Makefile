@@ -42,36 +42,35 @@ PG_CFLAGS += $(OPTFLAGS) -ftree-vectorize -fassociative-math -fno-signed-zeros -
 
 CXX = g++
 
-# knowhere
-KNOWHERE_LIBS := -L/home/liu4127/knowhere/build/Release -lknowhere -lknowhere_utils /home/liu4127/knowhere/build/Release/libfaiss.a
+# The runtime builder writes this file from its pinned Conan graph. It carries
+# only compiler and linker flags; no developer home directory is baked into
+# this Makefile or into vector.so's RPATH.
+POSTGRESQLV_DEPS_MK ?= $(CURDIR)/postgresqlv-deps.mk
+-include $(POSTGRESQLV_DEPS_MK)
 
-# Folly and nlohmann from Conan (your path)
-NLOHMANN_INC := -I/home/liu4127/.conan/data/nlohmann_json/3.11.2/_/_/package/5ab84d6acfe1f23c4fae0ab88f26e3a396351ac9/include
-FOLLY_BASE   := /home/liu4127/.conan/data/folly/2023.10.30.09/milvus/dev/package/763c5ce8d7ce4bf601cff416efb08f89b95b9205
-FOLLY_INC    := -I$(FOLLY_BASE)/include
-FOLLY_LIBDIR := $(FOLLY_BASE)/lib
-FOLLY_LIB    := -L$(FOLLY_LIBDIR) -lfolly
+PG_CONFIG ?= /opt/postgresql17/bin/pg_config
+KNOWHERE_ROOT ?= /opt/postgresqlv-runtime/knowhere-install
+KNOWHERE_INCLUDEDIR ?= $(KNOWHERE_ROOT)/include
+KNOWHERE_LIBDIR ?= $(KNOWHERE_ROOT)/lib
+KNOWHERE_SOURCE ?= /opt/postgresqlv-runtime/src/knowhere
+POSTGRESQLV_RUNTIME_LIBDIR ?= $(shell $(PG_CONFIG) --pkglibdir)/postgresqlv-runtime
 
-# glog from Conan
-GLOG_BASE   := /home/liu4127/.conan/data/glog/0.6.0/_/_/package/dd3c9e0dd79522c7df25a63d555c80dfef332d06
-GLOG_INC    := -I$(GLOG_BASE)/include
-GLOG_LIBDIR := $(GLOG_BASE)/lib
-GLOG_LIB    := -L$(GLOG_LIBDIR) -lglog
+PGV_DEP_CPPFLAGS ?=
+PGV_DEP_SHLIB_LINK ?=
 
-CXXFLAGS += -std=c++17 $(OPTFLAGS) -O3 -Ofast -march=native -fopenmp \
+CXXFLAGS += -std=c++20 $(OPTFLAGS) -O3 -Ofast -march=native -fopenmp \
 			-ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math
-
-CPPFLAGS += $(GLOG_INC)
 
 PG_CPPFLAGS += -I$(shell $(PG_CONFIG) --includedir-server)
 PG_CPPFLAGS += -I$(shell $(PG_CONFIG) --includedir)/internal
-PG_CPPFLAGS += $(NLOHMANN_INC) $(FOLLY_INC) $(GLOG_INC)
-# PG_CPPFLAGS += -I/usr/local/include
-PG_CPPFLAGS += -I/home/liu4127/knowhere/include -I/home/liu4127/knowhere/src -I/home/liu4127/knowhere/thirdparty
+PG_CPPFLAGS += -I$(KNOWHERE_INCLUDEDIR) -I$(KNOWHERE_SOURCE)/src \
+              -I$(KNOWHERE_SOURCE)/thirdparty \
+              -I$(KNOWHERE_SOURCE)/thirdparty/faiss -I/usr/include/openblas
+PG_CPPFLAGS += $(PGV_DEP_CPPFLAGS)
 PG_CPPFLAGS += -DGLOG_NO_ABBREVIATED_SEVERITIES
-SHLIB_LINK += $(KNOWHERE_LIBS) $(FOLLY_LIB) $(GLOG_LIB) \
-              -L/usr/local/lib -L/usr/lib/x86_64-linux-gnu -lgflags -lpthread -lstdc++ -lc -lblas -fopenmp \
-              -Wl,-rpath,/home/liu4127/knowhere/build/Release -Wl,-rpath,$(GLOG_LIBDIR)
+SHLIB_LINK += -L$(KNOWHERE_LIBDIR) -lknowhere -lknowhere_utils -lfaiss \
+              $(PGV_DEP_SHLIB_LINK) -lpthread -lstdc++ -lc -lopenblas -fopenmp \
+              -Wl,-rpath,'$$ORIGIN/postgresqlv-runtime'
 
 
 %.o: %.cpp
@@ -82,9 +81,12 @@ all: sql/$(EXTENSION)--$(EXTVERSION).sql
 sql/$(EXTENSION)--$(EXTVERSION).sql: sql/$(EXTENSION).sql
 	cp $< $@
 
-PG_CONFIG ?= /home/liu4127/postgresql/pg_build_17/bin/pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+# PGXS's LLVM rule has a separate C++ flag set and otherwise defaults to the
+# PostgreSQL build's C++17 mode. Knowhere's pinned Folly requires C++20.
+override BITCODE_CXXFLAGS += -std=c++20
 
 # for Mac
 ifeq ($(PROVE),)
