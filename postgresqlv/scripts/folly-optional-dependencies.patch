@@ -1,0 +1,37 @@
+diff --git a/conanfile.py b/conanfile.py
+index 668c34f..11f1168 100644
+--- a/conanfile.py
++++ b/conanfile.py
+@@ -226,6 +226,31 @@ class FollyConan(ConanFile):
+             "project(${PACKAGE_NAME} CXX C ASM)",
+             'project(${PACKAGE_NAME} CXX C ASM)\nset(CMAKE_ASM_CREATE_SHARED_LIBRARY "${CMAKE_CXX_CREATE_SHARED_LIBRARY}")',
+         )
++        # Folly enables these optional C libraries solely by testing whether
++        # their headers are visible. They are not dependencies of this recipe,
++        # so enabling them can leave unresolved symbols in libfolly.so. Patch
++        # both compiled and installed headers to keep the package interface
++        # consistent on hosts which happen to provide the development headers.
++        optional_header_guards = {
++            "folly/hash/UniqueHashKey.cpp": ("blake3.h", "xxh3.h"),
++            "folly/hash/UniqueHashKey.h": ("blake3.h", "xxh3.h"),
++            "folly/hash/test/UniqueHashKeyTest.cpp": ("blake3.h", "xxh3.h"),
++            "folly/io/async/AsyncIO.cpp": ("libaio.h",),
++            "folly/io/async/AsyncIO.h": ("libaio.h",),
++            "folly/io/async/Liburing.h": ("liburing.h",),
++            "folly/io/async/SimpleAsyncIO.cpp": ("libaio.h",),
++        }
++        for relative_path, headers in optional_header_guards.items():
++            source_path = os.path.join(
++                self.source_folder, *relative_path.split("/")
++            )
++            for header in headers:
++                replace_in_file(
++                    self,
++                    source_path,
++                    f"__has_include(<{header}>)",
++                    "0",
++                )
+-
++
+     def build(self):
+         self._patch_sources()

@@ -16,7 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXTENSION_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PG_PKGLIBDIR="$(${PG_CONFIG} --pkglibdir)"
 
-for program in git conan cmake make pkg-config ccache patchelf readelf; do
+for program in git conan cmake make patch pkg-config ccache patchelf readelf; do
   command -v "${program}" >/dev/null || {
     echo "missing required program: ${program}" >&2
     exit 1
@@ -32,7 +32,7 @@ if [[ ! -d "${KNOWHERE_SOURCE}/.git" ]]; then
   git clone https://github.com/zilliztech/knowhere.git "${KNOWHERE_SOURCE}"
 fi
 git -C "${KNOWHERE_SOURCE}" fetch --quiet origin "${KNOWHERE_COMMIT}"
-git -C "${KNOWHERE_SOURCE}" checkout --detach "${KNOWHERE_COMMIT}"
+git -C "${KNOWHERE_SOURCE}" checkout --force --detach "${KNOWHERE_COMMIT}"
 
 # CMake 4 rejects several pinned transitive recipes that still declare a
 # pre-3.5 compatibility level. A wrapper applies CMake's documented bridge to
@@ -51,6 +51,43 @@ chmod 755 "${TOOL_DIR}/cmake"
 conan profile detect --force
 conan remote add milvus \
   https://milvus01.jfrog.io/artifactory/api/conan/default-conan-local2 --force
+
+# The pinned Milvus Folly recipe removes liburing from its dependency graph,
+# and does not model libaio, BLAKE3, or XXH3. Folly still enables all four
+# integrations with __has_include, so unrelated host development headers can
+# produce a shared library with unresolved symbols. Export a corrected local
+# revision which disables those unmodelled optional integrations before Conan
+# resolves the Knowhere graph.
+FOLLY_VERSION="2026.04.20.00"
+FOLLY_REMOTE_REF="folly/${FOLLY_VERSION}@milvus/dev#06852bea5b6449f0c4eb0df002b5779c"
+FOLLY_LOCAL_REF="folly/${FOLLY_VERSION}@postgresqlv/stable"
+FOLLY_RECIPE_DIR="${RUNTIME_ROOT}/src/folly-conan-recipe"
+conan download "${FOLLY_REMOTE_REF}" --remote=milvus --only-recipe
+FOLLY_RECIPE_EXPORT="$(conan cache path "${FOLLY_REMOTE_REF}")"
+FOLLY_RECIPE_EXPORT_SOURCE="$(
+  conan cache path "${FOLLY_REMOTE_REF}" --folder=export_source
+)"
+install -d "${FOLLY_RECIPE_DIR}"
+install -m 644 "${FOLLY_RECIPE_EXPORT}/conanfile.py" \
+  "${FOLLY_RECIPE_DIR}/conanfile.py"
+install -m 644 "${FOLLY_RECIPE_EXPORT}/conandata.yml" \
+  "${FOLLY_RECIPE_DIR}/conandata.yml"
+install -m 644 "${FOLLY_RECIPE_EXPORT_SOURCE}/src/conan_deps.cmake" \
+  "${FOLLY_RECIPE_DIR}/conan_deps.cmake"
+patch --quiet --forward --directory "${FOLLY_RECIPE_DIR}" --strip=1 \
+  <"${SCRIPT_DIR}/folly-optional-dependencies.patch"
+conan export "${FOLLY_RECIPE_DIR}" \
+  --user=postgresqlv --channel=stable
+sed -i \
+  "s|${FOLLY_REMOTE_REF}|${FOLLY_LOCAL_REF}|" \
+  "${KNOWHERE_SOURCE}/conanfile.py"
+sed -i \
+  "s|self.requires(\"${FOLLY_LOCAL_REF}\")|self.requires(\"${FOLLY_LOCAL_REF}\", force=True, override=True)|" \
+  "${KNOWHERE_SOURCE}/conanfile.py"
+grep -Fq "${FOLLY_LOCAL_REF}" "${KNOWHERE_SOURCE}/conanfile.py" || {
+  echo "failed to select the corrected local Folly recipe" >&2
+  exit 1
+}
 # Conan's current settings schema ends at GCC 15, while this container's
 # system compiler is GCC 16. Keep the package setting pinned to the newest
 # supported ABI-compatible value; the compiler executable itself remains the
@@ -115,10 +152,21 @@ DEPS_MK="${RUNTIME_ROOT}/postgresqlv-deps.mk"
     "$(pkg-config --libs milvus-common libfolly libglog gflags nlohmann_json)"
 } >"${DEPS_MK}"
 
-make -C "${EXTENSION_DIR}" clean all install \
-  PG_CONFIG="${PG_CONFIG}" KNOWHERE_ROOT="${KNOWHERE_PREFIX}" \
-  KNOWHERE_SOURCE="${KNOWHERE_SOURCE}" \
-  POSTGRESQLV_DEPS_MK="${DEPS_MK}"
+EXTENSION_MAKE_ARGS=(
+  "PG_CONFIG=${PG_CONFIG}"
+  "KNOWHERE_ROOT=${KNOWHERE_PREFIX}"
+  "KNOWHERE_SOURCE=${KNOWHERE_SOURCE}"
+  "POSTGRESQLV_DEPS_MK=${DEPS_MK}"
+  # PGXS bitcode uses Clang and cannot consume GCC's OpenMP headers exposed by
+  # Knowhere. The loadable extension does not need optional LLVM bitcode.
+  "with_llvm=no"
+)
+# Keep clean, build, and install as separate invocations. MAKEFLAGS commonly
+# enables parallelism, and multiple goals in one invocation may otherwise race
+# so that clean removes vector.so while install is copying it.
+make -C "${EXTENSION_DIR}" clean "${EXTENSION_MAKE_ARGS[@]}"
+make -C "${EXTENSION_DIR}" all "${EXTENSION_MAKE_ARGS[@]}"
+make -C "${EXTENSION_DIR}" install "${EXTENSION_MAKE_ARGS[@]}"
 
 # vector.so uses $ORIGIN/postgresqlv-runtime. Bundle only non-system shared
 # libraries resolved from Conan, add SONAME aliases, and remove Conan's
@@ -164,9 +212,20 @@ patchelf --set-rpath '$ORIGIN' "${KNOWHERE_PREFIX}/lib/libknowhere.so"
 install -D -m 755 "${KNOWHERE_PREFIX}/lib/libknowhere.so" \
   "${RUNTIME_LIBDIR}/libknowhere.so"
 
-ldd "${PG_PKGLIBDIR}/vector.so"
-if ldd "${PG_PKGLIBDIR}/vector.so" | grep -q 'not found'; then
-  echo "PostgreSQL-V runtime has unresolved shared libraries" >&2
+if ! RUNTIME_CHECK="$(ldd -r "${PG_PKGLIBDIR}/vector.so" 2>&1)"; then
+  printf '%s\n' "${RUNTIME_CHECK}"
+  echo "PostgreSQL-V runtime has unresolved libraries or symbols" >&2
   exit 1
 fi
+RUNTIME_SYMBOL_ERRORS="$(
+  grep 'undefined symbol' <<<"${RUNTIME_CHECK}" |
+    grep -Fv "(${PG_PKGLIBDIR}/vector.so)" || true
+)"
+if grep -q 'not found' <<<"${RUNTIME_CHECK}" ||
+  [[ -n "${RUNTIME_SYMBOL_ERRORS}" ]]; then
+  printf '%s\n' "${RUNTIME_CHECK}"
+  echo "PostgreSQL-V runtime has unresolved libraries or symbols" >&2
+  exit 1
+fi
+ldd "${PG_PKGLIBDIR}/vector.so"
 echo "PostgreSQL-V runtime installed with ${PG_CONFIG}"
