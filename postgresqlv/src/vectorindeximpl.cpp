@@ -550,7 +550,10 @@ VectorIndexSearchImpl(IndexType type, void* indexPtr, const knowhere::BitsetView
             conf[knowhere::indexparam::NPROBE] = efs_nprobe;
             break;
         case HNSW:
-            conf[knowhere::indexparam::EF] = efs_nprobe;
+            // Knowhere rejects HNSW searches when ef is smaller than top-k.
+            // Clamp here as a final defense for direct SQL callers whose GUCs
+            // were configured independently.
+            conf[knowhere::indexparam::EF] = std::max(efs_nprobe, k);
             break;
         case DISKANN:
             conf[knowhere::indexparam::SEARCH_LIST_SIZE] = efs_nprobe;
@@ -574,6 +577,14 @@ VectorIndexSearchImpl(IndexType type, void* indexPtr, const knowhere::BitsetView
     
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+
+    if (!res.has_value()) {
+        fprintf(stderr,
+                "[VectorIndexSearchImpl] Knowhere search failed: %s: %s\n",
+                knowhere::Status2String(res.error()).c_str(),
+                res.what().c_str());
+        return nullptr;
+    }
 
     // convert knowhere::Dataset to topKVector
     topKVector* topk_result = (topKVector *) malloc(sizeof(topKVector));
